@@ -582,12 +582,39 @@ def handle_commands():
                             )
                         send("\n".join(lines))
 
+                elif raw_text.upper().startswith("/IMPORTZONES"):
+                    # Format: /importzones ZONES_EXPORT:{...json...}
+                    try:
+                        parts = raw_text.strip().split(None, 1)
+                        if len(parts) < 2:
+                            send("⚠️ Format: /importzones ZONES_EXPORT:{...}")
+                        else:
+                            json_part = parts[1].strip()
+                            if json_part.startswith("ZONES_EXPORT:"):
+                                json_part = json_part[13:]
+                            data = json.loads(json_part)
+                            new_zones = {}
+                            for zid, z in data.items():
+                                new_zones[zid] = {
+                                    "symbol": z["symbol"], "tf": z["tf"],
+                                    "low": z["low"], "high": z["high"],
+                                    "added_time": z["added_time"],
+                                    "state": "waiting", "confirmed": False,
+                                    "went_up": False, "retest_entered": False,
+                                }
+                            manual_zones.update(new_zones)
+                            send(f"✅ {len(new_zones)} zones imported!\nTotal: {len(manual_zones)}")
+                            print(f"✅ Imported {len(new_zones)} zones")
+                    except Exception as e:
+                        send(f"❌ Import error: {e}")
+
                 elif text == "/HELP":
                     send(
                         "🤖 <b>Commands:</b>\n\n"
                         "/status — bot status\n"
                         "/sync — main bot থেকে zones+watchlist sync\n"
                         "/zones — active manual zones\n"
+                        "/importzones [JSON] — manually zones import করো\n"
                     )
 
         except Exception as e:
