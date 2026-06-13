@@ -13,7 +13,7 @@ from datetime import datetime
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-TELEGRAM_TOKEN = "8720676004:AAEHtoPX7GumTTToWCIYM7pLNH62vWdcOw4"
+TELEGRAM_TOKEN = "8973668144:AAFwvLoZhV1WDC5i0OIs8IpCylbkcx279Z8"
 ADMIN_CHAT_ID  = "6589114679"
 CHECK_INTERVAL = 5 * 60
 
