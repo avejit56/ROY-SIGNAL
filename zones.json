@@ -566,15 +566,6 @@
     "state": "dip_wait",
     "alert_sent_time": 0
   },
-  "OBUSDT_4h_1": {
-    "symbol": "OBUSDT",
-    "tf": "4h",
-    "low": 1.17,
-    "high": 1.2,
-    "added_time": 1781419196.575961,
-    "state": "waiting",
-    "alert_sent_time": 0
-  },
   "FETUSDT_4h_1": {
     "symbol": "FETUSDT",
     "tf": "4h",
@@ -828,7 +819,7 @@
     "alert_sent_time": 0
   },
   "GENIUSUSUSDT_4h_1": {
-    "symbol": "GENIUSUSUSDT",
+    "symbol": "GENIUSUSDT",
     "tf": "4h",
     "low": 0.4429,
     "high": 0.4573,
@@ -2745,7 +2736,7 @@
     "alert_sent_time": 0
   },
   "EULUUSDT_4h_1": {
-    "symbol": "EULUUSDT",
+    "symbol": "EULUSDT",
     "tf": "4h",
     "low": 1.147,
     "high": 1.165,
