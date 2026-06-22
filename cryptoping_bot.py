@@ -2984,51 +2984,55 @@ def detect_break_retest_pattern(klines_4h, current_price):
     score alone can't see — it needs to look at price structure over several
     candles, not just the latest one.
 
+    APPROACH (rewritten after the first version missed a real ENA retest):
+    The original version required a strict local-maximum (lower highs on BOTH
+    sides) to call something a "resistance swing high". Real charts are
+    messier than that — a resistance zone often has several candles near the
+    same high, and the breakout candle itself can sit right at the edge of the
+    lookback window where there's no room for "candles after" to confirm a
+    local max. Instead: find the strongest, most recent breakout candle in the
+    window first (the candle search recognizes as a genuine break), then use
+    the highest high in the candles BEFORE it as the resistance level being
+    broken. This matches how a person actually reads the chart — "what was
+    price struggling to get through before this candle blew past it" — rather
+    than requiring an isolated single-candle peak.
+
     Returns a single guidance string, or None if no clean pattern is found.
     """
-    if not klines_4h or len(klines_4h) < 15:
+    if not klines_4h or len(klines_4h) < 12:
         return None
 
     closed = klines_4h[:-1]
-    # Find swing-high candidates (local max with lower candles on both sides).
-    # NOTE: a breakout candle's own high can itself register as a local max —
-    # we don't just take the single most recent one; we try each candidate
-    # (most recent first) and only accept it as "the resistance" if a genuine
-    # break-then-retest sequence actually happened after it.
-    swing_highs = []
-    for i in range(2, len(closed) - 2):
-        h = float(closed[i][2])
-        if (h > float(closed[i-1][2]) and h > float(closed[i-2][2]) and
-            h > float(closed[i+1][2]) and h > float(closed[i+2][2])):
-            swing_highs.append((i, h))
-    if not swing_highs:
+    lookback = closed[-20:] if len(closed) >= 20 else closed
+    n = len(lookback)
+    if n < 8:
         return None
 
-    for level_idx, level_price in reversed(swing_highs):
-        candles_after = closed[level_idx + 1:]
-        if len(candles_after) < 3:
-            continue  # need room for a break candle AND at least one retest candle after it
-
-        broke_with_strength = False
-        break_candle_idx = None
-        for i, k in enumerate(candles_after):
-            o, c, h, l = float(k[1]), float(k[4]), float(k[2]), float(k[3])
-            candle_range = h - l
-            body = abs(c - o)
-            if c > level_price and c > o and candle_range > 0 and body / candle_range >= 0.55:
-                broke_with_strength = True
-                break_candle_idx = i
-                break
-        if not broke_with_strength:
+    # Find the most recent strong-body bullish candle that closed above the
+    # highest price seen in the candles before it — that's our breakout candle.
+    break_i = None
+    level_price = None
+    for i in range(n - 2, 3, -1):  # leave room for at least 1 candle after it (a retest candle)
+        k = lookback[i]
+        o, c, h, l = float(k[1]), float(k[4]), float(k[2]), float(k[3])
+        candle_range = h - l
+        body = abs(c - o)
+        if candle_range <= 0 or body / candle_range < 0.55 or c <= o:
             continue
+        prior_high = max(float(x[2]) for x in lookback[max(0, i - 8):i])
+        if c > prior_high * 1.005:  # closed meaningfully above the prior resistance
+            break_i = i
+            level_price = prior_high
+            break
 
-        candles_since_break = candles_after[break_candle_idx + 1:]
-        if not candles_since_break:
-            continue  # break candle is the most recent closed candle — no retest data yet
+    if break_i is None or level_price is None:
+        return None
 
-        return _build_retest_guidance(level_price, current_price, candles_since_break)
+    candles_since_break = lookback[break_i + 1:]
+    if not candles_since_break:
+        return None
 
-    return None
+    return _build_retest_guidance(level_price, current_price, candles_since_break)
 
 def _build_retest_guidance(level_price, current_price, candles_since_break):
     near_level = abs(current_price - level_price) / level_price <= 0.05
