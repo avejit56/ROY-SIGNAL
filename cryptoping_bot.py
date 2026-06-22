@@ -147,6 +147,7 @@ trendline_alerted = {}
 postpump_alerted = {}
 ob_fvg_zone_tracking = {}
 trendline_retest_tracking = {}
+retest_watch_list = {}  # {f"{symbol}_{chat_id}": {symbol, chat_id, requested_time, last_seen_state}}
 signal_performance = {}
 buy_pressure_alerted = {}
 last_coin_alert = {}
@@ -180,6 +181,7 @@ SIGNAL_PERFORMANCE_FILE = os.path.join(_BOT_DIR, "signal_performance.json")
 PREPUMP_PHASES_FILE = os.path.join(_BOT_DIR, "prepump_phases.json")
 TRENDLINE_TRACKING_FILE = os.path.join(_BOT_DIR, "trendline_retest_tracking.json")
 COOLDOWN_TRACKERS_FILE = os.path.join(_BOT_DIR, "cooldown_trackers.json")
+RETEST_WATCH_FILE = os.path.join(_BOT_DIR, "retest_watch.json")
 
 # ─── PERSISTENT STORAGE ───────────────────────────────────
 WATCHLIST_MSG_ID = None
@@ -379,6 +381,25 @@ def load_cooldown_trackers():
     except Exception as e:
         print(f"Cooldown trackers load error: {e}")
 
+def save_retest_watch():
+    try:
+        with open(RETEST_WATCH_FILE, "w") as f:
+            _json.dump(retest_watch_list, f, indent=2)
+    except Exception as e:
+        print(f"Retest watch save error: {e}")
+
+def load_retest_watch():
+    global retest_watch_list
+    try:
+        if os.path.exists(RETEST_WATCH_FILE):
+            with open(RETEST_WATCH_FILE) as f:
+                retest_watch_list = _json.load(f)
+            print(f"✅ Retest watch list loaded: {len(retest_watch_list)}")
+        else:
+            print("👁 No retest watch file, starting fresh")
+    except Exception as e:
+        print(f"Retest watch load error: {e}")
+
 def save_watchlist_file():
     try:
         extra = [c for c in watchlist if c not in DEFAULT_WATCHLIST]
@@ -448,6 +469,7 @@ def load_from_telegram():
     load_prepump_phases()
     load_trendline_tracking()
     load_cooldown_trackers()
+    load_retest_watch()
 
 # ─── TELEGRAM ─────────────────────────────────────────────
 def send_to(chat_id, message):
@@ -3284,6 +3306,55 @@ def calc_entry_score(symbol):
         }
 
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
+def check_retest_watches():
+    """
+    Checks every active /watch entry: has the retest completed (strong green
+    candle closed back above the broken level)? If so, notify the requesting
+    subscriber personally AND post to Top Picks (public visibility), then
+    remove the watch — it's a one-time alert per request, not ongoing tracking.
+    """
+    if not retest_watch_list:
+        return
+    to_remove = []
+    now = time.time()
+    for watch_key, watch in list(retest_watch_list.items()):
+        symbol = watch["symbol"]
+        # Expire stale watches after 5 days — if the retest hasn't resolved by
+        # then, the setup has likely changed enough that the original /entry
+        # read is stale anyway.
+        if now - watch.get("requested_time", now) > 5 * 86400:
+            to_remove.append(watch_key)
+            continue
+
+        klines_4h = get_klines(symbol, interval="4h", limit=30)
+        ticker = get_ticker(symbol)
+        if not klines_4h or not ticker:
+            continue
+        current_price = float(ticker["lastPrice"])
+        pattern_note = detect_break_retest_pattern(klines_4h, current_price)
+        if pattern_note and "Retest confirmed" in pattern_note:
+            msg = (
+                f"🔥 <b>Retest Complete — {symbol}</b>\n\n"
+                f"💰 Price: {format_price(current_price)}\n\n"
+                f"{pattern_note}\n\n"
+                f"⚠️ <i>Confirm on the chart and use a stop-loss.</i>"
+            )
+            send_to(watch["chat_id"], msg)
+            send_to_topic(TOPIC_TOP_PICKS, msg)
+            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}")
+            to_remove.append(watch_key)
+        elif pattern_note and "Retest failed" in pattern_note:
+            send_to(watch["chat_id"],
+                f"⚠️ <b>{symbol} retest failed</b> — price closed back below the broken level. "
+                f"Removing this from your watch list."
+            )
+            to_remove.append(watch_key)
+
+    for key in to_remove:
+        retest_watch_list.pop(key, None)
+    if to_remove:
+        save_retest_watch()
+
 def monitor_momentum():
     while True:
         now = time.time()
@@ -3628,6 +3699,8 @@ def monitor_momentum():
         for key in perf_remove:
             signal_performance.pop(key, None)
 
+        check_retest_watches()
+
         # Periodic persistence — signal_performance, prepump_phases,
         # trendline_retest_tracking, and the cooldown trackers were previously pure
         # in-memory and lost on every restart. Saving once per pass here (not on
@@ -3637,6 +3710,7 @@ def monitor_momentum():
         save_prepump_phases()
         save_trendline_tracking()
         save_cooldown_trackers()
+        save_retest_watch()
 
         time.sleep(60)
 
@@ -3683,6 +3757,10 @@ def handle_commands():
                             f"🔍 <b>Check a coin yourself:</b>\n"
                             f"Type /entry BTC (or any coin) anytime for a real-time technical\n"
                             f"snapshot — trend, structure, volume, and risk flags — before you decide.\n\n"
+                            f"👁 <b>Watch a retest:</b>\n"
+                            f"If /entry shows \"Retest in progress\", you can type /watch BTC to get\n"
+                            f"a personal alert (and a Top Picks post) the moment it completes.\n"
+                            f"Use /unwatch BTC to stop, or /mywatches to see your list.\n\n"
                             f"⚠️ <b>Keep in mind:</b>\n"
                             f"This is a volume alert, not a trading signal.\n"
                             f"When a notification comes in, analyze the chart yourself,\n"
@@ -3728,6 +3806,60 @@ def handle_commands():
                                 f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
                                 f"Always confirm on the chart and manage your own risk.</i>"
                             )
+
+                elif text.startswith("/WATCH "):
+                    sym_raw = text.replace("/WATCH ", "").strip().split()[0] if text.replace("/WATCH ", "").strip() else ""
+                    if not sym_raw:
+                        send_to(chat_id, "⚠️ Format: /watch BTC  (or /watch BTCUSDT)")
+                    else:
+                        sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
+                        watch_key = f"{sym}_{chat_id}"
+                        if watch_key in retest_watch_list:
+                            send_to(chat_id, f"👁 Already watching {sym} for a retest completion.")
+                        else:
+                            klines_4h_check = get_klines(sym, interval="4h", limit=30)
+                            ticker_check = get_ticker(sym)
+                            if not klines_4h_check or not ticker_check:
+                                send_to(chat_id, f"⚠️ Couldn't fetch data for {sym}. Check the symbol and try again.")
+                            else:
+                                current_price_check = float(ticker_check["lastPrice"])
+                                pattern_now = detect_break_retest_pattern(klines_4h_check, current_price_check)
+                                if not pattern_now or "Retest in progress" not in pattern_now:
+                                    send_to(chat_id,
+                                        f"⚠️ {sym} doesn't currently show an in-progress retest on 4H. "
+                                        f"/watch works best right after /entry shows a \"Retest in progress\" Pattern Context."
+                                    )
+                                else:
+                                    retest_watch_list[watch_key] = {
+                                        "symbol": sym, "chat_id": chat_id,
+                                        "requested_time": time.time(), "name": first_name,
+                                    }
+                                    save_retest_watch()
+                                    send_to(chat_id,
+                                        f"👁 <b>Watching {sym}</b> for retest completion.\n\n"
+                                        f"You'll get a personal alert here (and it'll also post to Top Picks) "
+                                        f"once a strong green candle closes back above the broken level.\n\n"
+                                        f"Use /unwatch {sym_raw} to stop."
+                                    )
+
+                elif text.startswith("/UNWATCH "):
+                    sym_raw = text.replace("/UNWATCH ", "").strip().split()[0] if text.replace("/UNWATCH ", "").strip() else ""
+                    sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
+                    watch_key = f"{sym}_{chat_id}"
+                    if watch_key in retest_watch_list:
+                        retest_watch_list.pop(watch_key, None)
+                        save_retest_watch()
+                        send_to(chat_id, f"👁 Stopped watching {sym}.")
+                    else:
+                        send_to(chat_id, f"⚠️ You weren't watching {sym}.")
+
+                elif text == "/MYWATCHES":
+                    mine = [v for v in retest_watch_list.values() if v["chat_id"] == chat_id]
+                    if not mine:
+                        send_to(chat_id, "👁 You're not watching any coins right now. Use /watch SYMBOL after /entry shows a retest in progress.")
+                    else:
+                        lines = [f"• {w['symbol']}" for w in mine]
+                        send_to(chat_id, "👁 <b>Your watches:</b>\n\n" + "\n".join(lines))
 
                 elif text.startswith("/ADD ") and is_admin:
                     symbol = text.replace("/ADD ", "").strip()
