@@ -2208,12 +2208,16 @@ def check_explosive_pump(symbol):
 
     alerted_coins[key] = now
 
-    ft_score, ft_details = calc_followthrough_score(symbol, "5m", klines, vol_ratio, buy_ratio, current_price)
+    ft_score, ft_details = calc_followthrough_score(symbol, "5m", klines, vol_ratio, buy_ratio, current_price, change_24h)
     high_potential = ft_score >= 60
+    is_distribution_warning = any("DISTRIBUTION WARNING" in d or "bearish (red)" in d for d in ft_details)
     ft_tag = ""
     if high_potential:
         ft_details_str = "\n   ".join(ft_details)
         ft_tag = f"\n\n🔥 <b>HIGH FOLLOW-THROUGH POTENTIAL ({ft_score})</b>\n   {ft_details_str}"
+    elif is_distribution_warning:
+        ft_details_str = "\n   ".join(ft_details)
+        ft_tag = f"\n\n   {ft_details_str}"
 
     msg = (
         f"💥 <b>EXPLOSIVE PUMP DETECTED! [5M]</b>\n\n"
@@ -2854,9 +2858,31 @@ If the score is 60+, that Volume Spike/Explosive Pump signal also goes to High
 Priority alongside its normal topic — flagged as "a good follow-through candidate".
 This isn't a guarantee, but it's a filter to separate high-potential signals from noise.
 """
-def calc_followthrough_score(symbol, tf, klines, vol_ratio, buy_ratio, current_price):
+def calc_followthrough_score(symbol, tf, klines, vol_ratio, buy_ratio, current_price, change_24h=None):
     score = 0
     details = []
+
+    # ── Distribution pattern check (added after TNSRUSDT case) ──
+    # A huge volume spike during a price that's DOWN heavily on the day is a
+    # classic distribution signature: large holders unload into retail buying
+    # interest right as the move attracts attention, then the price dumps
+    # further once that supply is absorbed. The old logic only checked daily
+    # EMA position for "trend", which can still say "bullish/neutral" while the
+    # coin is actively crashing — it never looked at the spike candle's own
+    # direction or the actual 24h change. This check looks at both directly and
+    # can veto the whole score to flag a likely distribution event instead of
+    # following through.
+    last_candle = klines[-2]
+    spike_candle_bearish = float(last_candle[4]) < float(last_candle[1])  # close < open
+    heavy_24h_down = change_24h is not None and change_24h <= -10.0
+
+    if heavy_24h_down and vol_ratio >= 10:
+        details.append(f"🚨 DISTRIBUTION WARNING — {change_24h:+.1f}% on 24h with {vol_ratio:.1f}x volume")
+        details.append("⚠️ Large volume during a heavy daily decline can mean big holders are selling into this spike, not buying — be cautious about treating this as a bullish signal")
+        return 0, details
+    if spike_candle_bearish and vol_ratio >= 10:
+        details.append(f"⚠️ Spike candle itself is bearish (red) despite {vol_ratio:.1f}x volume — this may be selling pressure, not buying")
+        score -= 10
 
     # Daily trend check
     if not is_daily_downtrend(symbol, current_price):
@@ -2905,8 +2931,109 @@ def calc_followthrough_score(symbol, tf, klines, vol_ratio, buy_ratio, current_p
 
     return score, details
 
-# ─── VOLUME SPIKE ─────────────────────────────────────────
-def check_timeframe(symbol, tf):
+# ─── /ENTRY ON-DEMAND TECHNICAL CHECK ─────────────────────
+"""
+Public command: any subscriber can run /entry SYMBOL to get a real-time
+technical snapshot before deciding whether to take an entry — without waiting
+for the bot to fire a signal on its own. This reuses the same building blocks
+the bot's own signals are scored with (EMA position, structure/swing-low,
+volume, daily trend, distribution-risk check), but framed as a single combined
+"entry health" score where higher = more favorable conditions right now.
+
+This is explicitly NOT a win-probability number (see the team's earlier
+decision against fabricated percentages) — it's a transparent breakdown of
+observable technical conditions so the person can make their own informed
+call, consistent with the bot's "honest, no exaggerated claims" positioning.
+"""
+def calc_entry_score(symbol):
+    klines_1h = get_klines(symbol, interval="1h", limit=30)
+    klines_4h = get_klines(symbol, interval="4h", limit=30)
+    ticker = get_ticker(symbol)
+    if not klines_1h or len(klines_1h) < 15 or not ticker:
+        return None  # not enough data — caller should report "unavailable"
+
+    closed_1h = klines_1h[:-1]
+    closes_1h = [float(k[4]) for k in closed_1h]
+    current_price = closes_1h[-1]
+    change_24h = float(ticker["priceChangePercent"])
+
+    score = 0
+    max_score = 0
+    details = []
+
+    # ── Distribution-risk veto (same logic as calc_followthrough_score) ──
+    last_candle = klines_1h[-2]
+    spike_vol = float(last_candle[5])
+    prev_vols_1h = [float(k[5]) for k in closed_1h[-8:-1]]
+    avg_vol_1h = sum(prev_vols_1h) / len(prev_vols_1h) if prev_vols_1h else 1
+    vol_ratio_1h = spike_vol / avg_vol_1h if avg_vol_1h else 1
+    if change_24h <= -10.0 and vol_ratio_1h >= 10:
+        return {
+            "score": 0, "max_score": 100, "label": "🔴 AVOID",
+            "details": [
+                f"🚨 DISTRIBUTION WARNING — {change_24h:+.1f}% on 24h with {vol_ratio_1h:.1f}x recent volume",
+                "⚠️ This pattern often means large holders selling into retail interest, not a genuine bullish move",
+            ],
+            "price": current_price,
+        }
+
+    # ── 1H EMA position ──
+    ema20_1h = calculate_ema(closes_1h, 20)
+    max_score += 20
+    if ema20_1h and current_price > ema20_1h * 1.01:
+        score += 20
+        details.append(f"✅ Above 1H 20EMA with margin ({format_price(ema20_1h)})")
+    elif ema20_1h and current_price > ema20_1h:
+        score += 10
+        details.append(f"⚠️ Just above 1H 20EMA ({format_price(ema20_1h)})")
+    else:
+        details.append(f"❌ Below 1H 20EMA" + (f" ({format_price(ema20_1h)})" if ema20_1h else ""))
+
+    # ── Daily trend ──
+    max_score += 20
+    if not is_daily_downtrend(symbol, current_price):
+        score += 20
+        details.append("✅ Daily trend bullish/neutral")
+    else:
+        details.append("❌ Daily downtrend")
+
+    # ── Structure: higher lows on 1H ──
+    max_score += 20
+    if check_hl_only(closed_1h, lookback=8):
+        score += 20
+        details.append("✅ Higher lows forming (1H)")
+    else:
+        details.append("⚠️ No clear higher-low structure (1H)")
+
+    # ── Recent volume / momentum ──
+    max_score += 20
+    if vol_ratio_1h >= 2.0:
+        score += 20
+        details.append(f"✅ Elevated recent volume ({vol_ratio_1h:.1f}x avg)")
+    elif vol_ratio_1h >= 1.2:
+        score += 10
+        details.append(f"⚠️ Slightly elevated volume ({vol_ratio_1h:.1f}x avg)")
+    else:
+        details.append(f"⚠️ Normal/low volume ({vol_ratio_1h:.1f}x avg)")
+
+    # ── Extended-move warning (informational, doesn't add/subtract score) ──
+    if change_24h >= 50:
+        details.append(f"⚠️ Already +{change_24h:.0f}% in 24h — an extended move, consider waiting for a pullback")
+
+    # ── 4H confluence with a daily level, if available ──
+    if klines_4h and len(klines_4h) >= 10:
+        recent_low_4h = min(float(k[3]) for k in klines_4h[-10:-1])
+        recent_high_4h = max(float(k[2]) for k in klines_4h[-10:-1])
+        is_confluent, conf_note = check_daily_confluence(symbol, recent_low_4h, recent_high_4h)
+        if is_confluent:
+            max_score += 10
+            score += 10
+            details.append(f"🎯 Daily confluence — {conf_note}")
+
+    label = "🟢 HIGH" if score / max_score >= 0.75 else ("🟡 MEDIUM" if score / max_score >= 0.45 else "🔴 LOW")
+    return {"score": score, "max_score": max_score, "label": label, "details": details, "price": current_price}
+
+
     cfg = TIMEFRAMES[tf]
     klines = get_klines(symbol, interval=tf, limit=50)
     if not klines or len(klines) < 10:
@@ -2979,12 +3106,18 @@ def check_timeframe(symbol, tf):
     price = float(ticker["lastPrice"]) if ticker else close_price
     change_24h = float(ticker["priceChangePercent"]) if ticker else 0
 
-    ft_score, ft_details = calc_followthrough_score(symbol, tf, klines, ratio, 0, price)
+    ft_score, ft_details = calc_followthrough_score(symbol, tf, klines, ratio, 0, price, change_24h)
     high_potential = ft_score >= 60
+    is_distribution_warning = any("DISTRIBUTION WARNING" in d or "bearish (red)" in d for d in ft_details)
     ft_tag = ""
     if high_potential:
         ft_details_str = "\n   ".join(ft_details)
         ft_tag = f"\n\n🔥 <b>HIGH FOLLOW-THROUGH POTENTIAL ({ft_score})</b>\n   {ft_details_str}"
+    elif is_distribution_warning:
+        # Always surface this even though it's not a "high potential" tag —
+        # the warning itself is the important information here, not a bonus.
+        ft_details_str = "\n   ".join(ft_details)
+        ft_tag = f"\n\n   {ft_details_str}"
 
     msg = (
         f"{cfg['emoji']} <b>VOLUME SPIKE! [{cfg['label']}]</b>\n\n"
@@ -3000,7 +3133,7 @@ def check_timeframe(symbol, tf):
     if sent and high_potential:
         send_to_topic(TOPIC_HIGH, msg)  # escalate — separate from normal Spikes topic
     if sent:
-        print(f"✅ [{cfg['label']}] Spike: {symbol} ({ratio:.1f}x) | FT score: {ft_score}")
+        print(f"✅ [{cfg['label']}] Spike: {symbol} ({ratio:.1f}x) | FT score: {ft_score}{' [DISTRIBUTION WARNING]' if is_distribution_warning else ''}")
         signal_performance[f"{symbol}_spike_{tf}_{int(now)}"] = {
             "symbol": symbol, "signal_price": price,
             "signal_time": now, "signal_type": f"Volume Spike [{cfg['label']}]",
@@ -3417,6 +3550,9 @@ def handle_commands():
                             f"🎯 OB Bounce — MTF-confirmed bounce from a key zone\n"
                             f"💚 Buy Pressure — large buyers stepping in\n"
                             f"🎉 Pump Result — lets everyone know when a signal pumps 20%+\n\n"
+                            f"🔍 <b>Check a coin yourself:</b>\n"
+                            f"Type /entry BTC (or any coin) anytime for a real-time technical\n"
+                            f"snapshot — trend, structure, volume, and risk flags — before you decide.\n\n"
                             f"⚠️ <b>Keep in mind:</b>\n"
                             f"This is a volume alert, not a trading signal.\n"
                             f"When a notification comes in, analyze the chart yourself,\n"
@@ -3438,6 +3574,26 @@ def handle_commands():
                 elif text == "/LIST":
                     coin_lines = [f"• {c}" for c in watchlist]
                     send_chunked(chat_id, coin_lines, header=f"📋 <b>Watchlist ({len(watchlist)} coins):</b>\n\n")
+
+                elif text.startswith("/ENTRY "):
+                    sym_raw = text.replace("/ENTRY ", "").strip().split()[0] if text.replace("/ENTRY ", "").strip() else ""
+                    if not sym_raw:
+                        send_to(chat_id, "⚠️ Format: /entry BTC  (or /entry BTCUSDT)")
+                    else:
+                        sym = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
+                        result = calc_entry_score(sym)
+                        if result is None:
+                            send_to(chat_id, f"⚠️ Couldn't fetch enough data for {sym}. Check the symbol and try again.")
+                        else:
+                            details_str = "\n".join(result["details"])
+                            send_to(chat_id,
+                                f"📊 <b>Entry Check — {sym}</b>\n\n"
+                                f"💰 Price: {format_price(result['price'])}\n"
+                                f"📈 Score: {result['score']}/{result['max_score']} ({result['label']})\n\n"
+                                f"{details_str}\n\n"
+                                f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
+                                f"Always confirm on the chart and manage your own risk.</i>"
+                            )
 
                 elif text.startswith("/ADD ") and is_admin:
                     symbol = text.replace("/ADD ", "").strip()
