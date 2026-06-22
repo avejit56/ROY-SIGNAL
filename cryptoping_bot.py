@@ -1483,6 +1483,35 @@ def check_manual_zones():
             last   = klines_tf[-2]
             l_open = float(last[1])
             l_close= float(last[4])
+            l_high = float(last[2])
+            l_low  = float(last[3])
+
+            # Item #19: wick-rejection early warning. A candle at/near the zone
+            # with a long lower wick and a small body signals sellers got rejected
+            # fast (buyers stepped in before the close) — this is visible BEFORE
+            # the full body-close+volume confirmation fires, so it gives an early
+            # heads-up to watch the next candle closely instead of being caught
+            # off guard by a sharp bounce (e.g. the ALICEUSDT case).
+            candle_range = l_high - l_low
+            if candle_range > 0:
+                lower_wick = min(l_open, l_close) - l_low
+                body = abs(l_close - l_open)
+                wick_dominant = lower_wick / candle_range >= 0.55
+                small_body = body / candle_range <= 0.35
+                near_zone = l_low <= z_high and l_low >= z_low * 0.97
+                wick_key = f"{zone_id}_wick_{int(last[0])}"  # candle open-time, so each candle only triggers once
+                if wick_dominant and small_body and near_zone and not zone.get("last_wick_alert_candle") == last[0]:
+                    manual_zones[zone_id]["last_wick_alert_candle"] = last[0]
+                    save_zones()
+                    send_to_topic(TOPIC_HIGH,
+                        f"👀 <b>WATCH CLOSELY — Wick Rejection at Zone</b>\n\n"
+                        f"🪙 <b>{symbol}</b> | {tf.upper()} OB\n"
+                        f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
+                        f"💰 Current: {format_price(current_price)}\n"
+                        f"📉 Long lower wick + small body — possible early reversal\n\n"
+                        f"⚠️ <i>Not a full confirmation yet — watch the next candle.</i>"
+                    )
+                    print(f"👀 Wick rejection watch: {zone_id}")
 
             if l_close < z_low and l_close < l_open:
                 manual_zones[zone_id]["state"] = "dip_wait"
@@ -1562,6 +1591,19 @@ def check_manual_zones():
                     if is_confluent:
                         confluence_tag = f"🎯 <b>HIGH CONFLUENCE ZONE</b> — {conf_note}\n"
 
+                # Item #15: coiling duration context. A zone that's been actively
+                # watched for a long time (many touches, no breakout yet) has been
+                # "coiling" — accumulated pressure that tends to release in a bigger
+                # move once it finally breaks. This doesn't predict WHEN a zone will
+                # break, but flags the breakout, once it happens, as more significant
+                # than a fresh/short-lived zone's bounce.
+                coiling_days = (now - zone["added_time"]) / 86400
+                coiling_tag = ""
+                if coiling_days >= 30:
+                    coiling_tag = f"⏳ <b>LONG-COILED ZONE</b> — active {coiling_days:.0f} days, this breakout may be significant\n"
+                elif coiling_days >= 14:
+                    coiling_tag = f"⏳ Coiling — active {coiling_days:.0f} days\n"
+
                 msg = (
                     f"🎯 <b>ZONE CONFIRMED! [{tf.upper()} OB]</b>\n\n"
                     f"🪙 <b>{symbol}</b>\n"
@@ -1569,6 +1611,7 @@ def check_manual_zones():
                     f"📊 24h: {change_24h:+.2f}%\n"
                     f"🔲 Zone: {format_price(z_low)} — {format_price(z_high)}\n"
                     f"{confluence_tag}"
+                    f"{coiling_tag}"
                     f"✅ {tf.upper()} green body close\n"
                     f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n"
                     f"📈 From zone low: +{recovery_pct:.1f}%\n\n"
@@ -1577,9 +1620,32 @@ def check_manual_zones():
                     f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
                     f"⚠️ <i>Check the chart before entry.</i>"
                 )
-                # Zone alerts → routed automatically by send_all via get_topic_for_message
-                send_all(msg, symbol=symbol)
-                print(f"🎯 Zone confirmed: {zone_id}")
+                # Items #20/#21: Top Picks — the highest-confidence prospects get
+                # their own topic, separated from the High Priority noise. Since
+                # most manual zones are already 4H, requiring timeframe alone would
+                # make almost everything a "Top Pick" and defeat the purpose. Instead
+                # require at least 2 of these strong signals together: long coiling,
+                # daily confluence, 1D timeframe specifically, or exceptional volume.
+                # When this fires, the message goes ONLY to Top Picks, not also to
+                # High Priority — no duplication, per explicit preference.
+                top_pick_signals = sum([
+                    coiling_days >= 30,
+                    bool(confluence_tag),
+                    tf == "1d",
+                    vol_ratio >= 3.0,
+                ])
+                is_top_pick = top_pick_signals >= 2
+
+                # Zone alerts → routed automatically by send_all via get_topic_for_message,
+                # UNLESS this qualifies as a Top Pick, in which case it goes only there.
+                if is_top_pick:
+                    send_to_topic(TOPIC_TOP_PICKS, msg)
+                    # Still broadcast to subscribers' personal DMs, just not to High Priority
+                    for sub_chat_id in subscribers:
+                        send_to(sub_chat_id, msg)
+                else:
+                    send_all(msg, symbol=symbol)
+                print(f"🎯 Zone confirmed: {zone_id}{' [TOP PICK]' if is_top_pick else ''}")
                 signal_performance[f"{symbol}_zone_{int(now)}"] = {
                     "symbol": symbol, "signal_price": current_price,
                     "signal_time": now, "signal_type": f"Zone OB [{tf.upper()}]",
@@ -2285,26 +2351,15 @@ def check_prepump(symbol):
     if weekly_ok:     signs_3.append("✅ Weekly uptrend")
     if rsi_ok:        signs_3.append(f"📉 RSI recovering ({rsi:.0f})")
 
-    # ── PHASE 1: Early Watch — admin only (Buildups topic, not High Priority — not yet an actionable signal) ──
+    # ── PHASE 1: Early Watch — tracked internally only, no notification.
+    # Phase 1 used to send a message here, but it's not yet an actionable signal
+    # (just early accumulation forming) and was generating too much noise. The
+    # bot still records phase1_time below so Phase 2's 30-min cooldown-after-
+    # phase-1 logic keeps working exactly as before — only the notification
+    # itself is removed. ──
     if current_phase == 0 and score_phase1 >= 3:
         alerted_coins[key] = now
         prepump_phases[symbol] = {"phase": 1, "phase1_time": now, "phase2_time": 0}
-        send_to_topic(TOPIC_BUILDUPS,
-            f"🔍 <b>PHASE 1 — Early Watch</b>\n\n"
-            f"🪙 <b>{symbol}</b>\n"
-            f"💰 Price: {format_price(current_price)}\n"
-            f"📊 24h: {change_24h:+.2f}%\n\n"
-            f"{'\\n'.join(signs_1)}\n\n"
-            f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-            f"⚠️ <i>Accumulation starting — keep watching.</i>"
-        )
-        send_to(ADMIN_CHAT_ID,
-            f"🔍 <b>PHASE 1 — Early Watch</b>\n\n"
-            f"🪙 <b>{symbol}</b> | Score: {score_phase1}/3\n"
-            f"💰 {format_price(current_price)} | 24h: {change_24h:+.2f}%\n\n"
-            f"{'\\n'.join(signs_1)}"
-        )
-        print(f"🔍 Phase 1: {symbol}")
         return
 
     # ── PHASE 2: Setup Forming — subscribers + buildups topic ──
@@ -3751,19 +3806,35 @@ def main():
         f"📋 Coins: {len(watchlist)}\n"
         f"👥 Subscribers: {len(subscribers)}\n"
         f"💼 Active trades: {len(active_trades)}\n\n"
-        f"This build (foundation pass):\n"
-        f"• 🌐 Renamed/rebranded to CryptoPing, fully English\n"
-        f"• 🗂 New topic structure (High Priority, Quick Spikes, Building\n"
-        f"  Momentum, Signal Results, Trade Monitor, User Trades,\n"
-        f"  User Trade Results, Top Picks)\n"
-        f"• 💾 signal_performance, prepump_phases, and trendline_retest_tracking\n"
-        f"  are now persisted to disk — no longer lost on restart\n"
-        f"• 🐛 Fixed: manual zone confirmation no longer silently blocked by\n"
-        f"  the confidence score — score is shown as context, never a gate\n"
-        f"• 🐛 Fixed: Explosive Pump's \"already dumped\" filter was too strict\n"
-        f"  (0.97 → 0.90), which was causing real moves like RARE/TNSR to\n"
-        f"  be missed\n\n"
+        f"This build:\n"
+        f"• 🐛 Fixed connection-pool leak that exhausted ephemeral ports under\n"
+        f"  parallel scanning — now uses a shared, pooled HTTP session\n"
+        f"• 🐛 get_klines/get_ticker now log real errors instead of silently\n"
+        f"  swallowing them (this is what surfaced the HTTP 451 geo-block)\n"
+        f"• 🔇 Phase 1 (Early Watch) no longer sends a notification — tracked\n"
+        f"  internally only; Phase 2/3 still notify as before\n"
+        f"• 📅 1D timeframe added across Volume Spike, Buildup, Higher Lows,\n"
+        f"  and Trendline Breakout/Retest\n"
+        f"• 📈 Higher Lows check now also requires Higher Highs (real uptrend\n"
+        f"  structure, not just one bounce)\n"
+        f"• 🚫 1H trendline breakout/retest disabled (was timing-sensitive and\n"
+        f"  a source of missed signals) — 4H/1D trendline stays active, as\n"
+        f"  does 1H manual-zone OB bounce/confirm (proven signal source)\n"
+        f"• 📐 Lower channel-line breakout detection added (descending channel\n"
+        f"  support breaks, not just upper resistance breaks)\n"
+        f"• 📅 /addzone now accepts 1D as a timeframe\n"
+        f"• 👀 Wick-rejection early warning at manual zones (before full\n"
+        f"  confirmation, flags long-lower-wick rejection candles)\n"
+        f"• ⏳ Zone-confirmed messages now show coiling duration (zones\n"
+        f"  active 14+/30+ days get flagged — bigger breakouts tend to\n"
+        f"  follow long consolidation)\n"
+        f"• 🔥 New Top Picks topic — zone confirmations with 2+ strong signals\n"
+        f"  (long coiling, daily confluence, 1D timeframe, 3x+ volume) route\n"
+        f"  there instead of High Priority, no duplication\n\n"
         f"Carried over from before:\n"
+        f"• 🌐 CryptoPing rebrand, fully English, persistent state files\n"
+        f"• 🐛 Zone confirmation no longer silently blocked by confidence score\n"
+        f"• 🐛 Explosive Pump's \"already dumped\" filter relaxed (0.97 → 0.90)\n"
         f"• 🐛 Duplicate-message and topic-routing fixes\n"
         f"• ⚡ Re-pump detection for sideways→breakout moves with no retest\n"
         f"• 🔥 Follow-through score on Volume Spike/Explosive Pump\n"
