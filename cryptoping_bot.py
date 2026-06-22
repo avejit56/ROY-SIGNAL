@@ -18,7 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import time
 from datetime import datetime
-from threading import Thread
+from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── SHARED HTTP SESSION (connection-pool fix) ─────────────
@@ -611,17 +611,46 @@ def get_klines(symbol, interval="5m", limit=50):
         print(f"⚠️ get_klines {symbol} {interval} exception: {e}")
     return None
 
-def get_ticker(symbol):
+# ─── BULK TICKER CACHE (rate-limit fix) ────────────────────
+"""
+BUGFIX: get_ticker(symbol) used to make one individual API call per symbol,
+every time any check function needed 24h change / last price. With 422 coins
+checked on a 5-min loop, calling this dozens of times per coin per pass added
+up to thousands of requests per cycle — enough to exceed Binance's request-
+weight limit and get the IP banned (HTTP 418, "Way too much request weight
+used"). Binance's own error message suggests the fix: batch requests instead
+of one-per-symbol.
+
+Binance's /api/v3/ticker/24hr endpoint, called WITHOUT a symbol parameter,
+returns ALL symbols' ticker data in a single response. We fetch that once
+every TICKER_CACHE_TTL seconds and serve every get_ticker() call from this
+in-memory cache — turning thousands of requests into one.
+"""
+_ticker_cache = {"data": {}, "fetched_at": 0}
+_ticker_cache_lock = Lock()
+TICKER_CACHE_TTL = 30  # seconds — refresh at most every 30s, regardless of how many checks happen
+
+def _refresh_ticker_cache():
     try:
-        r = http_session.get("https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": symbol}, timeout=10)
+        r = http_session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
         if r.status_code == 200:
-            return r.json()
+            all_tickers = r.json()
+            _ticker_cache["data"] = {t["symbol"]: t for t in all_tickers}
+            _ticker_cache["fetched_at"] = time.time()
         else:
-            print(f"⚠️ get_ticker {symbol}: HTTP {r.status_code} — {r.text[:200]}")
+            print(f"⚠️ ticker cache refresh: HTTP {r.status_code} — {r.text[:200]}")
     except Exception as e:
-        print(f"⚠️ get_ticker {symbol} exception: {e}")
-    return None
+        print(f"⚠️ ticker cache refresh exception: {e}")
+
+def get_ticker(symbol):
+    now = time.time()
+    if now - _ticker_cache["fetched_at"] > TICKER_CACHE_TTL:
+        with _ticker_cache_lock:
+            # Re-check inside the lock — another thread may have just refreshed
+            # while we were waiting for the lock, avoiding a redundant call.
+            if time.time() - _ticker_cache["fetched_at"] > TICKER_CACHE_TTL:
+                _refresh_ticker_cache()
+    return _ticker_cache["data"].get(symbol)
 
 def calculate_ema(closes, period=20):
     if len(closes) < period:
@@ -2945,6 +2974,87 @@ decision against fabricated percentages) — it's a transparent breakdown of
 observable technical conditions so the person can make their own informed
 call, consistent with the bot's "honest, no exaggerated claims" positioning.
 """
+def detect_break_retest_pattern(klines_4h, current_price):
+    """
+    Item: /entry Pattern Context. Looks for a "break → retest → continuation"
+    setup on 4H — a recent resistance level broken with a strong-body candle,
+    with price now back near that level checking whether it holds as new
+    support. This is one of the more reliable setups (the ENA case that
+    prompted this), and it's exactly the kind of context a static EMA/volume
+    score alone can't see — it needs to look at price structure over several
+    candles, not just the latest one.
+
+    Returns a single guidance string, or None if no clean pattern is found.
+    """
+    if not klines_4h or len(klines_4h) < 15:
+        return None
+
+    closed = klines_4h[:-1]
+    # Find swing-high candidates (local max with lower candles on both sides).
+    # NOTE: a breakout candle's own high can itself register as a local max —
+    # we don't just take the single most recent one; we try each candidate
+    # (most recent first) and only accept it as "the resistance" if a genuine
+    # break-then-retest sequence actually happened after it.
+    swing_highs = []
+    for i in range(2, len(closed) - 2):
+        h = float(closed[i][2])
+        if (h > float(closed[i-1][2]) and h > float(closed[i-2][2]) and
+            h > float(closed[i+1][2]) and h > float(closed[i+2][2])):
+            swing_highs.append((i, h))
+    if not swing_highs:
+        return None
+
+    for level_idx, level_price in reversed(swing_highs):
+        candles_after = closed[level_idx + 1:]
+        if len(candles_after) < 3:
+            continue  # need room for a break candle AND at least one retest candle after it
+
+        broke_with_strength = False
+        break_candle_idx = None
+        for i, k in enumerate(candles_after):
+            o, c, h, l = float(k[1]), float(k[4]), float(k[2]), float(k[3])
+            candle_range = h - l
+            body = abs(c - o)
+            if c > level_price and c > o and candle_range > 0 and body / candle_range >= 0.55:
+                broke_with_strength = True
+                break_candle_idx = i
+                break
+        if not broke_with_strength:
+            continue
+
+        candles_since_break = candles_after[break_candle_idx + 1:]
+        if not candles_since_break:
+            continue  # break candle is the most recent closed candle — no retest data yet
+
+        return _build_retest_guidance(level_price, current_price, candles_since_break)
+
+    return None
+
+def _build_retest_guidance(level_price, current_price, candles_since_break):
+    near_level = abs(current_price - level_price) / level_price <= 0.05
+    still_above = current_price >= level_price * 0.98  # hasn't broken back below it
+
+    last_candle = candles_since_break[-1]
+    last_o, last_c = float(last_candle[1]), float(last_candle[4])
+    last_h, last_l = float(last_candle[2]), float(last_candle[3])
+    last_range = last_h - last_l
+    last_is_strong_green = (
+        last_c > last_o and last_range > 0 and
+        (last_c - last_o) / last_range >= 0.55
+    )
+
+    if near_level and still_above and last_is_strong_green and last_c > level_price:
+        return (f"✅ <b>Retest confirmed</b> — price broke {format_price(level_price)} resistance, "
+                f"retested, and just closed back above it with a strong green candle. Continuation looks favorable.")
+    elif near_level and still_above:
+        return (f"⏳ <b>Retest in progress</b> — price broke {format_price(level_price)} resistance and is now "
+                f"retesting that level. Consider waiting for a green body candle to close back above "
+                f"{format_price(level_price)} before entering, with a stop-loss below the retest low.")
+    elif current_price < level_price * 0.98:
+        return (f"⚠️ <b>Retest failed</b> — price broke {format_price(level_price)} but has since closed back "
+                f"below it. This weakens the breakout; treat it with caution.")
+    return None
+
 def calc_entry_score(symbol):
     klines_1h = get_klines(symbol, interval="1h", limit=30)
     klines_4h = get_klines(symbol, interval="4h", limit=30)
@@ -2974,7 +3084,7 @@ def calc_entry_score(symbol):
                 f"🚨 DISTRIBUTION WARNING — {change_24h:+.1f}% on 24h with {vol_ratio_1h:.1f}x recent volume",
                 "⚠️ This pattern often means large holders selling into retail interest, not a genuine bullish move",
             ],
-            "price": current_price,
+            "price": current_price, "pattern_note": None,
         }
 
     # ── 1H EMA position ──
@@ -3030,8 +3140,14 @@ def calc_entry_score(symbol):
             score += 10
             details.append(f"🎯 Daily confluence — {conf_note}")
 
+    # ── Pattern context: break-retest-continuation (4H) ──
+    pattern_note = detect_break_retest_pattern(klines_4h, current_price) if klines_4h else None
+
     label = "🟢 HIGH" if score / max_score >= 0.75 else ("🟡 MEDIUM" if score / max_score >= 0.45 else "🔴 LOW")
-    return {"score": score, "max_score": max_score, "label": label, "details": details, "price": current_price}
+    return {
+        "score": score, "max_score": max_score, "label": label,
+        "details": details, "price": current_price, "pattern_note": pattern_note,
+    }
 
 
     cfg = TIMEFRAMES[tf]
@@ -3586,11 +3702,15 @@ def handle_commands():
                             send_to(chat_id, f"⚠️ Couldn't fetch enough data for {sym}. Check the symbol and try again.")
                         else:
                             details_str = "\n".join(result["details"])
+                            pattern_section = ""
+                            if result.get("pattern_note"):
+                                pattern_section = f"\n📐 <b>Pattern Context (4H):</b>\n{result['pattern_note']}\n"
                             send_to(chat_id,
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
                                 f"💰 Price: {format_price(result['price'])}\n"
                                 f"📈 Score: {result['score']}/{result['max_score']} ({result['label']})\n\n"
-                                f"{details_str}\n\n"
+                                f"{details_str}\n"
+                                f"{pattern_section}\n"
                                 f"⚠️ <i>This is a technical snapshot, not a win-probability or guarantee. "
                                 f"Always confirm on the chart and manage your own risk.</i>"
                             )
