@@ -488,8 +488,14 @@ def get_klines(symbol, interval="5m", limit=50):
             params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
         if r.status_code == 200:
             return r.json()
-    except:
-        pass
+        else:
+            # DIAGNOSTIC (temporary): log non-200 responses instead of silently
+            # swallowing them. 418/429 specifically indicate a Binance rate-limit
+            # ban on this IP — if that's what's happening, every single call will
+            # fail this way and explain "no errors, no activity" symptom exactly.
+            print(f"⚠️ get_klines {symbol} {interval}: HTTP {r.status_code} — {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ get_klines {symbol} {interval} exception: {e}")
     return None
 
 def get_ticker(symbol):
@@ -498,8 +504,10 @@ def get_ticker(symbol):
             params={"symbol": symbol}, timeout=10)
         if r.status_code == 200:
             return r.json()
-    except:
-        pass
+        else:
+            print(f"⚠️ get_ticker {symbol}: HTTP {r.status_code} — {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ get_ticker {symbol} exception: {e}")
     return None
 
 def calculate_ema(closes, period=20):
