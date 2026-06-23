@@ -148,6 +148,7 @@ postpump_alerted = {}
 ob_fvg_zone_tracking = {}
 trendline_retest_tracking = {}
 retest_watch_list = {}  # {f"{symbol}_{chat_id}": {symbol, chat_id, requested_time, last_seen_state}}
+_last_cleanup_check = 0  # timestamp of last weekly auto-cleanup run
 signal_performance = {}
 buy_pressure_alerted = {}
 last_coin_alert = {}
@@ -617,20 +618,53 @@ def get_updates():
     return []
 
 # ─── BINANCE ──────────────────────────────────────────────
+# ─── KLINES CACHE (rate-limit fix, part 2) ─────────────────
+"""
+BUGFIX continued: get_ticker was already fixed with a bulk cache, but
+get_klines still made one API call per (symbol, interval) — and within a
+single scan pass, MANY different check functions (check_timeframe,
+check_postpump_retracement, check_buy_pressure, calc_entry_score, etc.) all
+call get_klines for the SAME symbol+interval independently. With 426 coins
+across up to 4 timeframes, that's potentially 1700+ klines calls per cycle,
+even after the ticker fix — enough to trigger another 418 ban.
+
+A short TTL cache, keyed by (symbol, interval, limit), means repeated calls
+for the same symbol+interval within the same scan pass reuse one fetch
+instead of re-requesting. TTL is scaled to how often each timeframe's candle
+actually changes — no point re-fetching 4H klines every 30 seconds when the
+candle won't close for hours.
+"""
+_klines_cache = {}  # {(symbol, interval, limit): {"data": [...], "fetched_at": ts}}
+_klines_cache_lock = Lock()
+KLINES_CACHE_TTL = {
+    "5m": 30, "15m": 60, "1h": 120, "4h": 300, "1d": 900,
+}
+
 def get_klines(symbol, interval="5m", limit=50):
-    try:
-        r = http_session.get("https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
-        if r.status_code == 200:
-            return r.json()
-        else:
-            # DIAGNOSTIC (temporary): log non-200 responses instead of silently
-            # swallowing them. 418/429 specifically indicate a Binance rate-limit
-            # ban on this IP — if that's what's happening, every single call will
-            # fail this way and explain "no errors, no activity" symptom exactly.
-            print(f"⚠️ get_klines {symbol} {interval}: HTTP {r.status_code} — {r.text[:200]}")
-    except Exception as e:
-        print(f"⚠️ get_klines {symbol} {interval} exception: {e}")
+    cache_key = (symbol, interval, limit)
+    ttl = KLINES_CACHE_TTL.get(interval, 60)
+    now = time.time()
+    cached = _klines_cache.get(cache_key)
+    if cached and now - cached["fetched_at"] < ttl:
+        return cached["data"]
+
+    with _klines_cache_lock:
+        # Re-check inside the lock in case another thread just refreshed this
+        # exact key while we were waiting.
+        cached = _klines_cache.get(cache_key)
+        if cached and time.time() - cached["fetched_at"] < ttl:
+            return cached["data"]
+        try:
+            r = http_session.get("https://api.binance.com/api/v3/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                _klines_cache[cache_key] = {"data": data, "fetched_at": time.time()}
+                return data
+            else:
+                print(f"⚠️ get_klines {symbol} {interval}: HTTP {r.status_code} — {r.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ get_klines {symbol} {interval} exception: {e}")
     return None
 
 # ─── BULK TICKER CACHE (rate-limit fix) ────────────────────
@@ -3473,6 +3507,62 @@ def check_retest_watches():
     if to_remove:
         save_retest_watch()
 
+def auto_cleanup_poor_performers():
+    """
+    Weekly cost-control feature: removes "extra" (non-default) watchlist coins
+    that HAD a signal in the last 7 days but never reached +20% gain on any of
+    them. This is intentionally conservative:
+      - DEFAULT_WATCHLIST coins are NEVER touched — only coins added later
+        (manually or via auto-watchlist-update) are eligible for removal.
+      - A coin with ZERO signals in the last 7 days is left alone — no signal
+        doesn't mean "bad coin", it might just mean no setup has formed yet.
+        Only coins that DID get a signal but underperformed get removed.
+    This directly reduces ongoing API call volume (fewer coins to scan every
+    cycle), which is the main lever for keeping Railway costs down.
+    """
+    now = time.time()
+    cutoff = now - 7 * 86400
+    extra_coins = [c for c in watchlist if c not in DEFAULT_WATCHLIST]
+    if not extra_coins:
+        return
+
+    # Build a per-symbol best-gain-in-window map from signal_performance
+    best_gain = {}
+    has_recent_signal = set()
+    for data in signal_performance.values():
+        if data.get("signal_time", 0) < cutoff:
+            continue
+        symbol = data.get("symbol")
+        if not symbol:
+            continue
+        has_recent_signal.add(symbol)
+        signal_price = data.get("signal_price", 0)
+        highest = data.get("highest_after", signal_price)
+        if signal_price > 0:
+            gain_pct = (highest - signal_price) / signal_price * 100
+            best_gain[symbol] = max(best_gain.get(symbol, 0), gain_pct)
+
+    to_remove = []
+    for symbol in extra_coins:
+        if symbol in has_recent_signal and best_gain.get(symbol, 0) < 20.0:
+            to_remove.append((symbol, best_gain.get(symbol, 0)))
+
+    if not to_remove:
+        return
+
+    for symbol, gain in to_remove:
+        watchlist.remove(symbol)
+    save_watchlist_file()
+
+    lines = [f"• {sym} (best: {gain:+.1f}%)" for sym, gain in to_remove]
+    send_to(ADMIN_CHAT_ID,
+        f"🧹 <b>Weekly Cleanup</b>\n\n"
+        f"Removed {len(to_remove)} coin(s) that had signals in the last 7 days "
+        f"but never reached +20%:\n\n" + "\n".join(lines) +
+        f"\n\nTotal watchlist: {len(watchlist)} coins"
+    )
+    print(f"🧹 Auto-cleanup removed {len(to_remove)} coins: {[s for s, _ in to_remove]}")
+
 def monitor_momentum():
     while True:
         now = time.time()
@@ -3819,6 +3909,15 @@ def monitor_momentum():
 
         check_retest_watches()
 
+        # Weekly auto-cleanup (cost control) — only runs once every 7 days
+        global _last_cleanup_check
+        if time.time() - _last_cleanup_check > 7 * 86400:
+            try:
+                auto_cleanup_poor_performers()
+            except Exception as e:
+                print(f"Auto-cleanup error: {e}")
+            _last_cleanup_check = time.time()
+
         # Periodic persistence — signal_performance, prepump_phases,
         # trendline_retest_tracking, and the cooldown trackers were previously pure
         # in-memory and lost on every restart. Saving once per pass here (not on
@@ -4017,6 +4116,15 @@ def handle_commands():
                         f"🏆 TL Retest: {len(trendline_retest_tracking)}\n"
                         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
                     )
+
+                elif text == "/CLEANUP" and is_admin:
+                    extra_count_before = len([c for c in watchlist if c not in DEFAULT_WATCHLIST])
+                    if extra_count_before == 0:
+                        send_to(chat_id, "🧹 No extra coins to evaluate — watchlist is just the defaults.")
+                    else:
+                        send_to(chat_id, f"🧹 Running cleanup check on {extra_count_before} extra coins...")
+                        auto_cleanup_poor_performers()
+                        send_to(chat_id, f"✅ Done. Total watchlist now: {len(watchlist)} coins.")
 
                 elif (text == "/REPORT" or raw_text.upper().startswith("/REPORT ")) and is_admin:
                     # /report           -> defaults to last 24h
