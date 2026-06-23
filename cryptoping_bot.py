@@ -41,6 +41,52 @@ _adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=2)
 http_session.mount("https://", _adapter)
 http_session.mount("http://", _adapter)
 
+# ─── GLOBAL BINANCE RATE LIMITER (fixes repeated 418 bans) ──
+"""
+BUGFIX: even after caching klines/ticker, a cold start (every restart/redeploy
+wipes the in-memory cache) means ALL 429 coins x 4 timeframes try to fetch
+fresh data within the same few seconds, across 10 parallel threads. That burst
+alone is enough to exceed Binance's actual documented limit of 1200 request
+weight per minute and trigger an HTTP 418 IP ban — this has now happened
+multiple times specifically right after a deploy.
+
+This is a simple token-bucket limiter: every outbound call to Binance must
+acquire a slot before firing, and slots refill at a fixed safe rate. This caps
+the bot's total request rate globally, across every thread, every endpoint,
+at all times — not just at startup. The target rate is intentionally well
+under Binance's 1200/min ceiling to leave headroom for weight differences
+between endpoints (the no-symbol bulk ticker call costs much more than a
+single klines call) and for any other usage on the same IP.
+"""
+_binance_rate_lock = Lock()
+_binance_call_times = []  # sliding window of recent call timestamps
+BINANCE_MAX_CALLS_PER_WINDOW = 8    # ~8 calls/sec sustained -> ~960 weight/min (klines weight=2),
+                                     # leaving headroom under Binance's 1200/min ceiling for the
+                                     # heavier no-symbol bulk ticker call too
+BINANCE_RATE_WINDOW = 1.0           # seconds
+
+def _binance_rate_limit_wait():
+    """Blocks the calling thread until a request slot is available."""
+    while True:
+        with _binance_rate_lock:
+            now = time.time()
+            # Drop timestamps older than the window
+            while _binance_call_times and _binance_call_times[0] < now - BINANCE_RATE_WINDOW:
+                _binance_call_times.pop(0)
+            if len(_binance_call_times) < BINANCE_MAX_CALLS_PER_WINDOW:
+                _binance_call_times.append(now)
+                return
+        time.sleep(0.05)
+
+_original_session_get = http_session.get
+
+def _rate_limited_get(url, *args, **kwargs):
+    if "binance.com" in url:
+        _binance_rate_limit_wait()
+    return _original_session_get(url, *args, **kwargs)
+
+http_session.get = _rate_limited_get
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")  # set in Railway → Variables
 ADMIN_CHAT_ID = "6589114679"
 CHECK_INTERVAL = 5 * 60
@@ -4689,6 +4735,13 @@ def main():
             time.sleep(60)
 
     Thread(target=run_active_trades, daemon=True).start()
+
+    # Pre-warm the ticker cache once before the first scan pass — without this,
+    # the first parallel pass after a cold start would have many threads each
+    # individually trigger a ticker refresh before any of them see a populated
+    # cache, multiplying calls right at the worst possible moment (startup).
+    print("🔥 Pre-warming ticker cache before first scan...")
+    _refresh_ticker_cache()
 
     while True:
         wl = list(watchlist)
