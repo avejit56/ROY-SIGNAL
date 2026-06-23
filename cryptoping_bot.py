@@ -3182,22 +3182,36 @@ def detect_break_retest_pattern(klines_4h, current_price):
     if n < 8:
         return None
 
-    # Find the most recent strong-body bullish candle that closed above the
-    # highest price seen in the candles before it — that's our breakout candle.
-    # NOTE: relaxed from 0.55 to 0.40 body/range ratio — a genuine breakout
-    # candle often still has a real wick (price pushes higher within the same
-    # candle before settling back somewhat), and requiring a near-full body
-    # was filtering out real breakouts like ENA's, where the close was still
-    # well above the prior resistance even with a wick on top.
+    # Find the most recent bullish candle that closed above the highest price
+    # seen in the candles before it — that's our breakout candle. Qualifies via
+    # EITHER strong body ratio OR strong volume+buy-pressure (matching how the
+    # bot's own zone-confirmation logic already validates breakouts). This is
+    # the second relaxation: the IQUSDT case showed a real breakout candle with
+    # a large upper wick (price pushed even higher within the candle before
+    # settling back) that failed the body-ratio test outright, even though the
+    # bot's own zone logic had already confirmed it as a genuine breakout using
+    # volume (1.5x+) and buy pressure (52%+) instead of candle shape.
     break_i = None
     level_price = None
     for i in range(n - 2, 3, -1):  # leave room for at least 1 candle after it (a retest candle)
         k = lookback[i]
-        o, c, h, l = float(k[1]), float(k[4]), float(k[2]), float(k[3])
+        o, c, h, l, v = float(k[1]), float(k[4]), float(k[2]), float(k[3]), float(k[5])
+        buy_v = float(k[9]) if len(k) > 9 else 0
         candle_range = h - l
         body = abs(c - o)
-        if candle_range <= 0 or body / candle_range < 0.40 or c <= o:
+        if candle_range <= 0 or c <= o:
             continue
+
+        body_ratio_ok = body / candle_range >= 0.40
+        prev_vols = [float(x[5]) for x in lookback[max(0, i - 8):i]]
+        avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+        vol_ratio = v / avg_vol if avg_vol else 0
+        buy_ratio = buy_v / v if v > 0 else 0
+        volume_confirmed_ok = vol_ratio >= 1.5 and buy_ratio >= 0.52
+
+        if not (body_ratio_ok or volume_confirmed_ok):
+            continue
+
         prior_high = max(float(x[2]) for x in lookback[max(0, i - 8):i])
         if c > prior_high * 1.005:  # closed meaningfully above the prior resistance
             break_i = i
