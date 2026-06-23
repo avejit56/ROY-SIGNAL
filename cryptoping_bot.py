@@ -3334,11 +3334,30 @@ def calc_entry_score(symbol):
     prev_vols_1h = [float(k[5]) for k in closed_1h[-8:-1]]
     avg_vol_1h = sum(prev_vols_1h) / len(prev_vols_1h) if prev_vols_1h else 1
     vol_ratio_1h = spike_vol / avg_vol_1h if avg_vol_1h else 1
-    if change_24h <= -10.0 and vol_ratio_1h >= 10:
+
+    # FIX (after the MBL case): the old -10% threshold let -9.71% slip through —
+    # an arbitrary boundary missed a textbook distribution pattern by a fraction
+    # of a percentage point. Relaxed to -7% for real margin.
+    heavy_24h_down = change_24h <= -7.0 and vol_ratio_1h >= 10
+
+    # FIX: also check directly whether price has given back most of a recent
+    # spike, regardless of where 24h change lands — this is the actual visible
+    # signature in the MBL chart (huge volume spike candle, then hard dump right
+    # after) and is a more direct signal than the 24h-change proxy alone.
+    recent_high_1h = max(float(k[2]) for k in closed_1h[-10:])
+    recent_low_1h = min(float(k[3]) for k in closed_1h[-10:])
+    spike_retraced = False
+    if recent_high_1h > recent_low_1h:
+        retrace_pct = (recent_high_1h - current_price) / (recent_high_1h - recent_low_1h)
+        spike_retraced = retrace_pct >= 0.70 and vol_ratio_1h >= 5
+
+    if heavy_24h_down or spike_retraced:
+        reason = (f"{change_24h:+.1f}% on 24h with {vol_ratio_1h:.1f}x recent volume" if heavy_24h_down
+                   else f"price has given back most of a recent spike ({vol_ratio_1h:.1f}x volume high)")
         return {
             "score": 0, "max_score": 100, "label": "🔴 AVOID",
             "details": [
-                f"🚨 DISTRIBUTION WARNING — {change_24h:+.1f}% on 24h with {vol_ratio_1h:.1f}x recent volume",
+                f"🚨 DISTRIBUTION WARNING — {reason}",
                 "⚠️ This pattern often means large holders selling into retail interest, not a genuine bullish move",
             ],
             "price": current_price, "pattern_note": None,
