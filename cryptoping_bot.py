@@ -203,6 +203,7 @@ last_update_id = 0
 volume_surge_alerted = {}   # {symbol: last_alert_time} — 6hr cooldown
 manual_zones = {}           # {zone_id: {symbol, tf, low, high, added_time, state}}
 zone_high_alerted = {}     # {zone_id_touch: last_notify_time}
+manual_lines = {}          # {line_id: {symbol, tf, price, added_time, state, chat_id, name}}
 last_scan_results = []      # cache for /addall
 
 # v68: Active Trade Monitor
@@ -229,6 +230,7 @@ PREPUMP_PHASES_FILE = os.path.join(_BOT_DIR, "prepump_phases.json")
 TRENDLINE_TRACKING_FILE = os.path.join(_BOT_DIR, "trendline_retest_tracking.json")
 COOLDOWN_TRACKERS_FILE = os.path.join(_BOT_DIR, "cooldown_trackers.json")
 RETEST_WATCH_FILE = os.path.join(_BOT_DIR, "retest_watch.json")
+MANUAL_LINES_FILE = os.path.join(_BOT_DIR, "manual_lines.json")
 
 # ─── PERSISTENT STORAGE ───────────────────────────────────
 WATCHLIST_MSG_ID = None
@@ -252,6 +254,25 @@ def load_zones():
             print("📐 No zones file, starting fresh")
     except Exception as e:
         print(f"Zone load error: {e}")
+
+def save_manual_lines():
+    try:
+        with open(MANUAL_LINES_FILE, "w") as f:
+            _json.dump(manual_lines, f, indent=2)
+    except Exception as e:
+        print(f"Manual line save error: {e}")
+
+def load_manual_lines():
+    global manual_lines
+    try:
+        if os.path.exists(MANUAL_LINES_FILE):
+            with open(MANUAL_LINES_FILE) as f:
+                manual_lines = _json.load(f)
+            print(f"✅ Manual lines loaded: {len(manual_lines)}")
+        else:
+            print("📏 No manual lines file, starting fresh")
+    except Exception as e:
+        print(f"Manual line load error: {e}")
 
 def push_signal_to_queue(signal):
     """
@@ -517,6 +538,7 @@ def load_from_telegram():
     load_trendline_tracking()
     load_cooldown_trackers()
     load_retest_watch()
+    load_manual_lines()
 
 # ─── TELEGRAM ─────────────────────────────────────────────
 def send_to(chat_id, message):
@@ -2078,7 +2100,152 @@ def check_manual_zones():
     if to_remove:
         save_zones()
 
-# ─── ACTIVE TRADE MONITOR ──────────────────────────
+# ─── MANUAL PRICE LINES (single-level break + retest) ──────
+"""
+/addline SYMBOL PRICE TIMEFRAME — for a single horizontal level you've drawn
+on the chart yourself (resistance or support, not a zone range). The bot
+tracks two stages on the given timeframe:
+
+  waiting → break: a candle closes with a strong body above the line,
+            with volume/buy-pressure confirmation (same criteria as
+            manual zone confirm: vol_ratio >= 1.5, buy_ratio >= 0.52).
+  break → retest: price comes back near the line and a green body candle
+            closes back above it — this is the "retest confirmed" alert,
+            sent to Top Picks + the requester's personal DM (same routing
+            as /watch).
+
+If price closes back below the line after a break without ever retesting
+cleanly (i.e. drops well under it), the line is marked failed and removed
+on the next check, so a single bad level doesn't sit around forever.
+"""
+
+def check_manual_lines():
+    now = time.time()
+    to_remove = []
+
+    for line_id, line in list(manual_lines.items()):
+        symbol  = line["symbol"]
+        tf      = line["tf"]
+        level   = line["price"]
+        state   = line.get("state", "waiting")
+        chat_id = line.get("chat_id")
+
+        if now - line["added_time"] > 30 * 24 * 3600:
+            to_remove.append(line_id)
+            continue
+
+        klines_tf = get_klines(symbol, interval=tf, limit=10)
+        ticker = get_ticker(symbol)
+        if not klines_tf or len(klines_tf) < 8 or not ticker:
+            continue
+        current_price = float(ticker["lastPrice"])
+
+        last    = klines_tf[-2]
+        l_open  = float(last[1])
+        l_close = float(last[4])
+        m_vol   = float(last[5])
+        m_buy   = float(last[9])
+        prev_vols = [float(k[5]) for k in klines_tf[-8:-2]]
+        avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 1
+        vol_ratio = m_vol / avg_vol if avg_vol > 0 else 0
+        buy_ratio = m_buy / m_vol if m_vol > 0 else 0
+        candle_key = int(last[0])  # candle open-time, so each candle only triggers once per stage
+
+        strong_break = (
+            l_close > l_open and
+            l_close > level and
+            vol_ratio >= 1.5 and
+            buy_ratio >= 0.52
+        )
+
+        # ── waiting → break ──
+        if state == "waiting":
+            if strong_break and line.get("last_break_candle") != candle_key:
+                manual_lines[line_id]["state"] = "broken"
+                manual_lines[line_id]["break_price"] = l_close
+                manual_lines[line_id]["break_time"] = now
+                manual_lines[line_id]["last_break_candle"] = candle_key
+                manual_lines[line_id]["lowest_since_break"] = l_close
+                save_manual_lines()
+                msg = (
+                    f"📏 <b>Line Break — {symbol} [{tf.upper()}]</b>\n\n"
+                    f"💰 Price: {format_price(current_price)}\n"
+                    f"📍 Level: {format_price(level)}\n"
+                    f"⚡ Volume: {vol_ratio:.1f}x | Buy: {buy_ratio*100:.0f}%\n\n"
+                    f"⏳ Watching for a retest now — you'll get another alert "
+                    f"if/when it confirms.\n\n"
+                    f"⚠️ <i>Confirm on the chart before treating this as actionable.</i>"
+                )
+                if chat_id:
+                    send_to(chat_id, msg)
+                print(f"📏 Line break: {line_id}")
+            continue
+
+        # ── broken → retest confirmed / failed ──
+        if state == "broken":
+            if current_price < line.get("lowest_since_break", level):
+                manual_lines[line_id]["lowest_since_break"] = current_price
+
+            # Failure: closes meaningfully back below the line after breaking it
+            if l_close < level * 0.97 and l_close < l_open:
+                to_remove.append(line_id)
+                if chat_id:
+                    send_to(chat_id,
+                        f"⚠️ <b>Line Invalidated — {symbol} [{tf.upper()}]</b>\n\n"
+                        f"Price broke {format_price(level)} but has now closed back "
+                        f"below it — treating this level as invalidated and removing "
+                        f"the watch.\n\n"
+                        f"Use /addline again if you want to re-mark it."
+                    )
+                print(f"📏 Line failed: {line_id}")
+                continue
+
+            near_level = abs(current_price - level) / level <= 0.05
+            retest_confirmed = (
+                near_level and
+                l_close > l_open and
+                l_close > level and
+                vol_ratio >= 1.3 and
+                buy_ratio >= 0.50 and
+                line.get("last_retest_candle") != candle_key
+            )
+
+            if retest_confirmed:
+                manual_lines[line_id]["last_retest_candle"] = candle_key
+                to_remove.append(line_id)  # one-shot alert, like /watch
+
+                suggestion, strength_details = analyze_move_strength(symbol, current_price)
+                strength_str = "\n".join(strength_details) if strength_details else ""
+                is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
+
+                intro_line = (
+                    f"⚠️ Price broke {format_price(level)} and the candle that closed back "
+                    f"above it on its own looks like a retest confirm — but see the warning below "
+                    f"before treating this as a green light."
+                    if is_distribution_flagged else
+                    f"✅ Price broke {format_price(level)}, retested, and just closed "
+                    f"back above it with a strong green candle. Continuation looks favorable."
+                )
+
+                msg = (
+                    f"🔥 <b>Line Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
+                    f"💰 Price: {format_price(current_price)}\n"
+                    f"📍 Level: {format_price(level)}\n\n"
+                    f"{intro_line}\n\n"
+                    f"📊 <b>Move Strength:</b>\n{strength_str}\n\n{suggestion}\n\n"
+                    f"⚠️ <i>Confirm on the chart and use a stop-loss.</i>"
+                )
+                send_to_topic(TOPIC_TOP_PICKS, msg)
+                if chat_id:
+                    send_to(chat_id, msg)
+                print(f"📏 Line retest confirmed: {line_id}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
+
+    for lid in to_remove:
+        manual_lines.pop(lid, None)
+    if to_remove:
+        save_manual_lines()
+
+
 """
 You report a trade entry manually with the /trade command (symbol, entry, sl, tp1/2/3).
 On every candle close (default 1H), the bot checks three layers to build a trend health score:
@@ -3258,7 +3425,11 @@ def detect_break_retest_pattern(klines_4h, current_price):
         volume_confirmed_ok = vol_ratio >= 1.5 and buy_ratio >= 0.52
 
         prior_high = max(float(x[2]) for x in lookback[max(0, i - 8):i])
-        closed_above = c > prior_high * 1.005
+        # FIX (after the JST case): a 0.5% margin missed a genuine breakout that
+        # closed only ~0.36% above prior_high — on lower-priced/lower-volatility
+        # coins, real breakouts often clear resistance by a small margin. Relaxed
+        # to 0.2%, still enough buffer to avoid noise-level "barely poking above".
+        closed_above = c > prior_high * 1.002
         debug_lines.append(
             f"  i={i}: body_ratio={body/candle_range:.2f}({body_ratio_ok}) "
             f"vol_ratio={vol_ratio:.1f}x({volume_confirmed_ok}, buy={buy_ratio:.2f}) "
@@ -3600,16 +3771,69 @@ def calc_entry_score(symbol):
 # ─── MOMENTUM MONITOR ─────────────────────────────────────
 def analyze_move_strength(symbol, confirm_price):
     """
-    After a /watch retest confirms on a smaller timeframe (15m/30m/1H), this
-    looks at how strong the underlying move actually is — volume intensity
+    After a /watch or /addline retest confirms on a smaller timeframe (15m/30m/1H),
+    this looks at how strong the underlying move actually is — volume intensity
     plus 5m/15m higher-low structure — to suggest whether the move looks
     strong enough to consider an earlier entry, or whether it's safer to wait
     for 4H to confirm too. This is explicitly a suggestion based on observable
     technical conditions, not a probability or guarantee — consistent with
     how /entry's score is framed.
+
+    It also runs the same distribution-risk check used in calc_entry_score and
+    calc_followthrough_score: a "retest" can be a fake breakout if large holders
+    are using the bounce to exit (price spikes, gets bought into briefly on the
+    retest, then dumps again on real volume) — the retest candle alone looks
+    bullish but the broader picture is distribution, not accumulation. When this
+    fires, it overrides the strength suggestion entirely with an explicit warning,
+    since a confirmed retest under a distribution pattern is the most dangerous
+    combination — it looks like the "safe" signal but isn't.
     """
     details = []
     strength_score = 0
+
+    # ── Distribution-risk check ──
+    # Unlike calc_entry_score (which checks this live, right at the spike candle),
+    # this runs AFTER a retest has already confirmed — meaning several candles have
+    # passed since the actual spike. Looking only at the most recent candle's volume
+    # would miss the pattern almost every time, since volume normalizes quickly after
+    # a spike. Instead, find the highest-volume candle in the recent window (the real
+    # spike, wherever it sits) and measure retracement from ITS high.
+    klines_1h_dist = get_klines(symbol, interval="1h", limit=15)
+    ticker_dist = get_ticker(symbol)
+    if klines_1h_dist and len(klines_1h_dist) >= 10 and ticker_dist:
+        closed_1h_dist = klines_1h_dist[:-1]
+        change_24h_dist = float(ticker_dist["priceChangePercent"])
+
+        window = closed_1h_dist[-10:]
+        baseline_vols = [float(k[5]) for k in closed_1h_dist[-15:-10]] or [float(k[5]) for k in window[:3]]
+        avg_baseline = sum(baseline_vols) / len(baseline_vols) if baseline_vols else 1
+
+        spike_idx = max(range(len(window)), key=lambda i: float(window[i][5]))
+        spike_candle_dist = window[spike_idx]
+        spike_vol_dist = float(spike_candle_dist[5])
+        vol_ratio_dist = spike_vol_dist / avg_baseline if avg_baseline else 1
+        spike_high_dist = float(spike_candle_dist[2])
+
+        heavy_24h_down = change_24h_dist <= -7.0 and vol_ratio_dist >= 10
+
+        low_since_spike = min(float(k[3]) for k in window[spike_idx:]) if spike_idx < len(window) else spike_high_dist
+        spike_retraced = False
+        if spike_high_dist > low_since_spike:
+            retrace_pct_dist = (spike_high_dist - confirm_price) / (spike_high_dist - low_since_spike)
+            spike_retraced = retrace_pct_dist >= 0.70 and vol_ratio_dist >= 5
+
+        if heavy_24h_down or spike_retraced:
+            reason = (f"{change_24h_dist:+.1f}% on 24h with {vol_ratio_dist:.1f}x recent volume" if heavy_24h_down
+                       else f"price has given back most of a recent spike on real volume ({vol_ratio_dist:.1f}x)")
+            return (
+                f"🚨 <b>DISTRIBUTION WARNING — possible fake breakout</b>\n"
+                f"⚠️ {reason}. A \"retest confirm\" candle can still appear here even "
+                f"while large holders are using the bounce to exit — treat this as a "
+                f"high-risk setup, not a green light. 4H confirmation is strongly "
+                f"recommended before any entry, and a tight stop-loss is essential if "
+                f"you do enter.",
+                [f"🚨 Distribution risk — {reason}"],
+            )
 
     # Volume intensity check (5m candles around the confirm moment)
     klines_5m = get_klines(symbol, interval="5m", limit=20)
@@ -3699,6 +3923,7 @@ def check_retest_watches():
             tf, pattern_note = confirmed_note
             suggestion, strength_details = analyze_move_strength(symbol, current_price)
             strength_str = "\n".join(strength_details)
+            is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
             msg = (
                 f"🔥 <b>Retest Complete — {symbol} [{tf.upper()}]</b>\n\n"
                 f"💰 Price: {format_price(current_price)}\n\n"
@@ -3709,7 +3934,7 @@ def check_retest_watches():
             )
             send_to(watch["chat_id"], msg)
             send_to_topic(TOPIC_TOP_PICKS, msg)
-            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}")
+            print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
             to_remove.append(watch_key)
         elif failed_note and not confirmed_note:
             tf, _ = failed_note
@@ -4195,6 +4420,10 @@ def handle_commands():
                             f"If /entry shows \"Retest in progress\", you can type /watch BTC to get\n"
                             f"a personal alert (and a Top Picks post) the moment it completes.\n"
                             f"Use /unwatch BTC to stop, or /mywatches to see your list.\n\n"
+                            f"📏 <b>Mark your own level:</b>\n"
+                            f"Drawn a resistance/support line yourself? /addline BTC 95000 4h\n"
+                            f"tracks it for a strong-body break, then alerts again when the\n"
+                            f"retest confirms. Use /removeline or /mylines to manage.\n\n"
                             f"⚠️ <b>Keep in mind:</b>\n"
                             f"This is a volume alert, not a trading signal.\n"
                             f"When a notification comes in, analyze the chart yourself,\n"
@@ -4440,6 +4669,10 @@ def handle_commands():
                         "/removezone BTC_4H_1 — remove a zone\n"
                         "/resetzone BTC_4H_1 — reactivate an invalidated zone\n"
                         "/zones — view all active zones\n\n"
+                        "<b>📏 Manual Line Commands (public, anyone can use):</b>\n"
+                        "/addline BTC 95000 4h — watch a single level for break+retest\n"
+                        "/removeline BTC_4h_1 — stop watching a line\n"
+                        "/mylines — view your active lines\n\n"
                         "<b>📊 Market Scan:</b>\n"
                         "/scanmarket — view USDT coins with 500K+ volume\n"
                         "/scanmarket 1000000 — custom volume threshold\n"
@@ -4699,6 +4932,70 @@ def handle_commands():
                         else:
                             send_to(chat_id, f"⚠️ Zone not found: {zone_id}")
 
+                elif raw_text.upper().startswith("/ADDLINE "):
+                    parts = raw_text.strip().split()
+                    if len(parts) != 4:
+                        send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 4h\n(timeframe must be 4h or 1d)")
+                    else:
+                        _, sym, price_s, ltf = parts
+                        sym = sym.upper()
+                        if not sym.endswith("USDT"):
+                            sym += "USDT"
+                        ltf = ltf.lower()
+                        if ltf not in ["4h", "1d"]:
+                            send_to(chat_id, "⚠️ Timeframe must be 4h or 1d for /addline")
+                        else:
+                            try:
+                                level_price = float(price_s)
+                                if level_price <= 0:
+                                    send_to(chat_id, "⚠️ Price must be greater than 0")
+                                else:
+                                    line_count = sum(1 for k in manual_lines if k.startswith(f"{sym}_{ltf}"))
+                                    line_id = f"{sym}_{ltf}_{line_count+1}"
+                                    manual_lines[line_id] = {
+                                        "symbol": sym, "tf": ltf,
+                                        "price": level_price,
+                                        "added_time": time.time(),
+                                        "state": "waiting",
+                                        "chat_id": chat_id,
+                                        "name": first_name,
+                                    }
+                                    save_manual_lines()
+                                    send_to(chat_id,
+                                        f"📏 <b>Line added!</b>\n\n"
+                                        f"🪙 {sym} | {ltf.upper()}\n"
+                                        f"📍 Level: {format_price(level_price)}\n"
+                                        f"🆔 ID: <code>{line_id}</code>\n\n"
+                                        f"Watching for a strong-body break above this level, "
+                                        f"then a confirmed retest. You'll get a personal alert "
+                                        f"at each stage (it'll also post to Top Picks on retest "
+                                        f"confirmation).\n\n"
+                                        f"Use /removeline {line_id} to stop."
+                                    )
+                                    print(f"📏 Line added: {line_id}")
+                            except ValueError:
+                                send_to(chat_id, "⚠️ Format: /addline RIF 0.0703 4h")
+
+                elif raw_text.upper().startswith("/REMOVELINE "):
+                    line_id = raw_text.strip().split(None, 1)[1].strip()
+                    if line_id in manual_lines:
+                        manual_lines.pop(line_id)
+                        save_manual_lines()
+                        send_to(chat_id, f"🗑 Line removed: <code>{line_id}</code>")
+                    else:
+                        send_to(chat_id, f"⚠️ Line not found: {line_id}\nUse /mylines to see your lines")
+
+                elif text == "/MYLINES":
+                    mine = {k: v for k, v in manual_lines.items() if v.get("chat_id") == chat_id}
+                    if not mine:
+                        send_to(chat_id, "📏 You have no active lines. Use /addline SYMBOL PRICE 4h to add one.")
+                    else:
+                        lines_out = []
+                        for lid, ln in mine.items():
+                            state_label = {"waiting": "⏳ waiting for break", "broken": "📈 broken, watching retest"}.get(ln.get("state"), ln.get("state"))
+                            lines_out.append(f"• <code>{lid}</code> — {ln['symbol']} {ln['tf'].upper()} @ {format_price(ln['price'])} ({state_label})")
+                        send_to(chat_id, "📏 <b>Your lines:</b>\n\n" + "\n".join(lines_out))
+
                 elif text == "/ZONES":
                     if not is_admin:
                         send_to(chat_id, "⚠️ Admin only.")
@@ -4902,6 +5199,17 @@ def main():
             time.sleep(60)
 
     Thread(target=run_manual_zones, daemon=True).start()
+
+    # Manual price lines (break + retest) — same pattern as manual zones
+    def run_manual_lines():
+        while True:
+            try:
+                check_manual_lines()
+            except Exception as e:
+                print(f"Manual line error: {e}")
+            time.sleep(60)
+
+    Thread(target=run_manual_lines, daemon=True).start()
 
     def run_active_trades():
         while True:
