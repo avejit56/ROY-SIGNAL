@@ -153,7 +153,7 @@ DEFAULT_WATCHLIST = [
     "JTOUSDT","ADXUSDT","ZECUSDT","NEARUSDT","EIGENUSDT","XVGUSDT","METUSDT","ETHFIUSDT",
     "AAVEUSDT","TIAUSDT","BBUSDT","HOMEUSDT","MIRUSDT","TCTUSDT","OMNIUSDT","LRCUSDT",
     "GUNUSDT","BREVUSDT","ALICEUSDT","ADADOWNUSDT","SPCXBUSDT","VELODROMEUSDT","INJUSDT",
-    "ELFUSDT","ENSOUSDT","IOTAUSDT","BCHUSDT","ROSEUSDT","PLUMEUSDT","VETUSDT","DNTUSDT",
+    "ENSOUSDT","IOTAUSDT","BCHUSDT","ROSEUSDT","PLUMEUSDT","VETUSDT","DNTUSDT",
     "PDAUSDT","1000CHEEMSUSDT","BTCSTUSDT","OMUSDT","RAREUSDT","UMAUSDT","MOVEUSDT",
     "BANKUSDT","BEAMXUSDT","BNSOLUSDT","MUBUSDT","LAYERUSDT","TWTUSDT","QNTUSDT",
     "JSTUSDT","YBUSDT","OXTUSDT","TAOUSDT","GRTUSDT","OPUSDT","PORTALUSDT","ASTERUSDT",
@@ -184,6 +184,8 @@ DEFAULT_SUBSCRIBERS_INFO = {
 
 watchlist = DEFAULT_WATCHLIST.copy()
 subscribers = DEFAULT_SUBSCRIBERS.copy()
+removed_coins = set()  # coins explicitly /remove'd — persisted so they don't reappear
+                        # even if they're in DEFAULT_WATCHLIST and the bot restarts
 
 alerted_coins = {}
 momentum_tracking = {}
@@ -221,6 +223,7 @@ import json as _json
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 ZONES_FILE     = os.path.join(_BOT_DIR, "zones.json")
 WATCHLIST_FILE = os.path.join(_BOT_DIR, "watchlist.json")
+REMOVED_COINS_FILE = os.path.join(_BOT_DIR, "removed_coins.json")
 SUBS_FILE      = os.path.join(_BOT_DIR, "subscribers.json")
 SIGNAL_QUEUE_FILE = os.path.join(_BOT_DIR, "signal_queue.json")
 TRADES_FILE    = os.path.join(_BOT_DIR, "active_trades.json")
@@ -476,19 +479,47 @@ def save_watchlist_file():
     except Exception as e:
         print(f"Watchlist save error: {e}")
 
+def save_removed_coins():
+    try:
+        with open(REMOVED_COINS_FILE, "w") as f:
+            _json.dump(sorted(removed_coins), f, indent=2)
+    except Exception as e:
+        print(f"Removed-coins save error: {e}")
+
+def load_removed_coins():
+    global removed_coins
+    try:
+        if os.path.exists(REMOVED_COINS_FILE):
+            with open(REMOVED_COINS_FILE) as f:
+                removed_coins = set(_json.load(f))
+            print(f"🗑 Removed-coins list loaded: {len(removed_coins)}")
+        else:
+            removed_coins = set()
+    except Exception as e:
+        print(f"Removed-coins load error: {e}")
+        removed_coins = set()
+
 def load_watchlist_file():
     global watchlist
-    watchlist = DEFAULT_WATCHLIST.copy()
+    # FIX: previously, /remove only removed a coin from the in-memory list for
+    # the current run — DEFAULT_WATCHLIST coins always came back on the next
+    # restart/redeploy because this function rebuilt watchlist from
+    # DEFAULT_WATCHLIST.copy() with no memory of what had been explicitly
+    # removed (the ELFUSDT case: removed via /remove, reappeared after the
+    # next redeploy, generating "new" signals on a coin already rejected).
+    # removed_coins is loaded first and applied here so a removal sticks
+    # permanently, even for hardcoded default coins.
+    watchlist = [c for c in DEFAULT_WATCHLIST if c not in removed_coins]
     try:
         if os.path.exists(WATCHLIST_FILE):
             with open(WATCHLIST_FILE) as f:
                 extra = _json.load(f)
             for c in extra:
-                if c not in watchlist:
+                if c not in watchlist and c not in removed_coins:
                     watchlist.append(c)
-            print(f"✅ Watchlist: {len(DEFAULT_WATCHLIST)} default + {len(extra)} extra = {len(watchlist)}")
+            print(f"✅ Watchlist: {len(watchlist) - len([c for c in extra if c not in removed_coins])} default + {len([c for c in extra if c not in removed_coins])} extra = {len(watchlist)} (removed: {len(removed_coins)})")
         else:
-            print(f"📋 Using default: {len(watchlist)} coins")
+            print(f"📋 Using default: {len(watchlist)} coins (removed: {len(removed_coins)})")
     except Exception as e:
         print(f"Watchlist load error: {e}")
 
@@ -528,6 +559,7 @@ def save_subscribers():
 
 def load_from_telegram():
     """Load all persistent data from files"""
+    load_removed_coins()   # must load before load_watchlist_file (which filters using it)
     load_watchlist_file()
     load_subscribers_file()
     load_zones()
@@ -2211,8 +2243,15 @@ def check_manual_lines():
             )
 
             if retest_confirmed:
+                # FIX (JST case, same root cause as /watch): a single confirming
+                # candle doesn't guarantee the breakout holds. Instead of removing
+                # the line here, move it into a "followup" state that checks the
+                # next up-to-3 candle closes before declaring the outcome.
                 manual_lines[line_id]["last_retest_candle"] = candle_key
-                to_remove.append(line_id)  # one-shot alert, like /watch
+                manual_lines[line_id]["state"] = "followup"
+                manual_lines[line_id]["followup_candles_checked"] = 0
+                manual_lines[line_id]["last_checked_candle"] = candle_key
+                save_manual_lines()
 
                 suggestion, strength_details = analyze_move_strength(symbol, current_price)
                 strength_str = "\n".join(strength_details) if strength_details else ""
@@ -2233,12 +2272,47 @@ def check_manual_lines():
                     f"📍 Level: {format_price(level)}\n\n"
                     f"{intro_line}\n\n"
                     f"📊 <b>Move Strength:</b>\n{strength_str}\n\n{suggestion}\n\n"
-                    f"⚠️ <i>Confirm on the chart and use a stop-loss.</i>"
+                    f"⏳ <i>Tracking the next 3 candles to confirm this holds — you'll get a follow-up.</i>"
                 )
                 send_to_topic(TOPIC_TOP_PICKS, msg)
                 if chat_id:
                     send_to(chat_id, msg)
                 print(f"📏 Line retest confirmed: {line_id}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
+            continue
+
+        # ── followup: confirm already fired, check whether it actually holds ──
+        if state == "followup":
+            last_candle_key = candle_key
+            if line.get("last_checked_candle") == last_candle_key:
+                continue  # already evaluated this candle close
+
+            manual_lines[line_id]["last_checked_candle"] = last_candle_key
+            candles_checked = line.get("followup_candles_checked", 0) + 1
+            manual_lines[line_id]["followup_candles_checked"] = candles_checked
+
+            if l_close < level * 0.98:
+                to_remove.append(line_id)
+                if chat_id:
+                    send_to(chat_id,
+                        f"⚠️ <b>{symbol} retest gave back the breakout [{tf.upper()}]</b>\n\n"
+                        f"The level held for the confirming candle, but price has now closed "
+                        f"back below {format_price(level)} — the continuation didn't hold. "
+                        f"Treat the earlier confirmation as invalidated."
+                    )
+                print(f"📏 Line followup FAILED: {line_id}")
+            elif candles_checked >= 3:
+                to_remove.append(line_id)
+                if chat_id:
+                    send_to(chat_id,
+                        f"✅ <b>{symbol} retest held [{tf.upper()}]</b>\n\n"
+                        f"3 candles since the confirmation and price is still holding above "
+                        f"{format_price(level)} (currently {format_price(current_price)}). "
+                        f"The breakout looks genuine so far — still confirm on the chart and "
+                        f"manage your own risk."
+                    )
+                print(f"📏 Line followup HELD: {line_id}")
+            else:
+                save_manual_lines()
 
     for lid in to_remove:
         manual_lines.pop(lid, None)
@@ -3881,8 +3955,24 @@ def check_retest_watches():
     """
     Checks every active /watch entry: has the retest completed (strong green
     candle closed back above the broken level)? If so, notify the requesting
-    subscriber personally AND post to Top Picks (public visibility), then
-    remove the watch — it's a one-time alert per request, not ongoing tracking.
+    subscriber personally AND post to Top Picks (public visibility).
+
+    FIX (after the JST case): "Retest confirmed" was a one-candle snapshot —
+    it fired the moment ONE strong green candle closed above the level, then
+    immediately removed the watch. But a single confirming candle doesn't
+    guarantee the breakout holds; the very next candle can roll right back
+    into the zone (exactly what happened with JST — confirmed, then the next
+    15M candle was red and price dropped straight back into the broken range).
+    Saying "Continuation looks favorable" and then dropping tracking made the
+    bot look wrong when it wasn't really tracking anything after that point.
+
+    Now, on confirm, the watch moves into a "followup" state instead of being
+    removed: the bot checks the next up-to-3 candle closes (on the timeframe
+    that confirmed) to see whether the level actually holds as support. Only
+    after that does it send a final outcome message and remove the watch —
+    or it sends an early failure alert immediately if a candle closes back
+    below the level before the 3 candles are up.
+
     Checks whichever timeframe(s) were in progress when /watch was created
     (4H, 1H, or both) — older watches without a stored "timeframes" key
     default to 4H only for backward compatibility.
@@ -3893,6 +3983,8 @@ def check_retest_watches():
     now = time.time()
     for watch_key, watch in list(retest_watch_list.items()):
         symbol = watch["symbol"]
+        stage = watch.get("stage", "watching")  # "watching" -> "followup" -> done
+
         # Expire stale watches after 5 days — if the retest hasn't resolved by
         # then, the setup has likely changed enough that the original /entry
         # read is stale anyway.
@@ -3900,12 +3992,52 @@ def check_retest_watches():
             to_remove.append(watch_key)
             continue
 
-        timeframes = watch.get("timeframes", ["4h"])
         ticker = get_ticker(symbol)
         if not ticker:
             continue
         current_price = float(ticker["lastPrice"])
 
+        # ── Follow-up stage: confirm already fired, now checking if it holds ──
+        if stage == "followup":
+            tf = watch["followup_tf"]
+            level_price = watch["followup_level"]
+            klines_tf = get_klines(symbol, interval=tf, limit=10)
+            if not klines_tf or len(klines_tf) < 3:
+                continue
+            last_closed = klines_tf[-2]
+            last_candle_key = int(last_closed[0])
+            if watch.get("last_checked_candle") == last_candle_key:
+                continue  # already evaluated this candle close
+            watch["last_checked_candle"] = last_candle_key
+
+            l_close = float(last_closed[4])
+            candles_checked = watch.get("followup_candles_checked", 0) + 1
+            watch["followup_candles_checked"] = candles_checked
+
+            if l_close < level_price * 0.98:
+                send_to(watch["chat_id"],
+                    f"⚠️ <b>{symbol} retest gave back the breakout [{tf.upper()}]</b>\n\n"
+                    f"The level held for the confirming candle, but price has now closed "
+                    f"back below {format_price(level_price)} — the continuation didn't hold. "
+                    f"Treat the earlier confirmation as invalidated."
+                )
+                print(f"⚠️ Retest follow-up FAILED: {symbol} -> {watch['chat_id']}")
+                to_remove.append(watch_key)
+            elif candles_checked >= 3:
+                send_to(watch["chat_id"],
+                    f"✅ <b>{symbol} retest held [{tf.upper()}]</b>\n\n"
+                    f"3 candles since the confirmation and price is still holding above "
+                    f"{format_price(level_price)} (currently {format_price(current_price)}). "
+                    f"The breakout looks genuine so far — still confirm on the chart and "
+                    f"manage your own risk."
+                )
+                print(f"✅ Retest follow-up HELD: {symbol} -> {watch['chat_id']}")
+                to_remove.append(watch_key)
+            save_retest_watch()
+            continue
+
+        # ── Watching stage: waiting for the initial confirm/fail ──
+        timeframes = watch.get("timeframes", ["4h"])
         confirmed_note = None
         failed_note = None
         for tf in timeframes:
@@ -3914,13 +4046,13 @@ def check_retest_watches():
                 continue
             pattern_note = detect_break_retest_pattern(klines_tf, current_price)
             if pattern_note and "Retest confirmed" in pattern_note:
-                confirmed_note = (tf, pattern_note)
+                confirmed_note = (tf, pattern_note, klines_tf)
                 break  # one confirmed timeframe is enough to notify
             elif pattern_note and "Retest failed" in pattern_note:
                 failed_note = (tf, pattern_note)
 
         if confirmed_note:
-            tf, pattern_note = confirmed_note
+            tf, pattern_note, klines_tf = confirmed_note
             suggestion, strength_details = analyze_move_strength(symbol, current_price)
             strength_str = "\n".join(strength_details)
             is_distribution_flagged = any("Distribution risk" in d for d in strength_details)
@@ -3930,12 +4062,24 @@ def check_retest_watches():
                 f"{pattern_note}\n\n"
                 f"📊 <b>Move Strength:</b>\n{strength_str}\n\n"
                 f"{suggestion}\n\n"
-                f"⚠️ <i>Confirm on the chart and use a stop-loss.</i>"
+                f"⏳ <i>Tracking the next 3 candles to confirm this holds — "
+                f"you'll get a follow-up.</i>"
             )
             send_to(watch["chat_id"], msg)
             send_to_topic(TOPIC_TOP_PICKS, msg)
             print(f"🔥 Retest complete notification sent: {symbol} -> {watch['chat_id']}{' [DISTRIBUTION FLAGGED]' if is_distribution_flagged else ''}")
-            to_remove.append(watch_key)
+
+            # Extract the level that was confirmed, from the pattern note text,
+            # so follow-up can check against it without re-running detection.
+            import re as _re
+            level_match = _re.search(r"broke ([\d.]+)", pattern_note)
+            followup_level = float(level_match.group(1)) if level_match else current_price
+            watch["stage"] = "followup"
+            watch["followup_tf"] = tf
+            watch["followup_level"] = followup_level
+            watch["followup_candles_checked"] = 0
+            watch["last_checked_candle"] = int(klines_tf[-2][0])
+            save_retest_watch()
         elif failed_note and not confirmed_note:
             tf, _ = failed_note
             send_to(watch["chat_id"],
@@ -4550,7 +4694,8 @@ def handle_commands():
                     if not mine:
                         send_to(chat_id, "👁 You're not watching any coins right now. Use /watch SYMBOL after /entry shows a retest in progress.")
                     else:
-                        lines = [f"• {w['symbol']}" for w in mine]
+                        stage_label = {"watching": "⏳ watching for retest", "followup": "🔎 confirmed, tracking continuation"}
+                        lines = [f"• {w['symbol']} ({stage_label.get(w.get('stage', 'watching'), 'watching')})" for w in mine]
                         send_to(chat_id, "👁 <b>Your watches:</b>\n\n" + "\n".join(lines))
 
                 elif text.startswith("/ADD ") and is_admin:
@@ -4563,6 +4708,8 @@ def handle_commands():
                         r = http_session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5)
                         if r.status_code == 200:
                             watchlist.append(symbol)
+                            removed_coins.discard(symbol)  # re-adding overrides a past /remove
+                            save_removed_coins()
                             save_watchlist()
                             send_to(chat_id, f"✅ {symbol} added! Total: {len(watchlist)}")
                         else:
@@ -4574,8 +4721,17 @@ def handle_commands():
                         symbol += "USDT"
                     if symbol in watchlist:
                         watchlist.remove(symbol)
+                        # FIX (ELFUSDT case): previously this only removed the coin from
+                        # the in-memory list — DEFAULT_WATCHLIST coins always came back
+                        # on the next restart/redeploy since load_watchlist_file() rebuilt
+                        # from DEFAULT_WATCHLIST.copy() every time. Now any removal is
+                        # tracked permanently in removed_coins, which load_watchlist_file()
+                        # checks on every load — the removal sticks even across redeploys,
+                        # for default coins too.
+                        removed_coins.add(symbol)
+                        save_removed_coins()
                         save_watchlist()
-                        send_to(chat_id, f"🗑 {symbol} removed. Total: {len(watchlist)}")
+                        send_to(chat_id, f"🗑 {symbol} removed permanently. Total: {len(watchlist)}")
                     else:
                         send_to(chat_id, f"⚠️ {symbol} isn't on the watchlist.")
 
@@ -4992,7 +5148,7 @@ def handle_commands():
                     else:
                         lines_out = []
                         for lid, ln in mine.items():
-                            state_label = {"waiting": "⏳ waiting for break", "broken": "📈 broken, watching retest"}.get(ln.get("state"), ln.get("state"))
+                            state_label = {"waiting": "⏳ waiting for break", "broken": "📈 broken, watching retest", "followup": "🔎 confirmed, tracking continuation"}.get(ln.get("state"), ln.get("state"))
                             lines_out.append(f"• <code>{lid}</code> — {ln['symbol']} {ln['tf'].upper()} @ {format_price(ln['price'])} ({state_label})")
                         send_to(chat_id, "📏 <b>Your lines:</b>\n\n" + "\n".join(lines_out))
 
