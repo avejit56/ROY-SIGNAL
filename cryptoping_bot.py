@@ -3315,6 +3315,8 @@ def _build_retest_guidance(level_price, current_price, candles_since_break):
 def calc_entry_score(symbol):
     klines_1h = get_klines(symbol, interval="1h", limit=30)
     klines_4h = get_klines(symbol, interval="4h", limit=30)
+    klines_15m = get_klines(symbol, interval="15m", limit=30)
+    klines_30m = get_klines(symbol, interval="30m", limit=30)
     ticker = get_ticker(symbol)
     if not klines_1h or len(klines_1h) < 15 or not ticker:
         return None  # not enough data — caller should report "unavailable"
@@ -3360,7 +3362,7 @@ def calc_entry_score(symbol):
                 f"🚨 DISTRIBUTION WARNING — {reason}",
                 "⚠️ This pattern often means large holders selling into retail interest, not a genuine bullish move",
             ],
-            "price": current_price, "pattern_note": None,
+            "price": current_price, "pattern_note": None, "pattern_notes": {},
         }
 
     # ── 1H EMA position ──
@@ -3416,21 +3418,28 @@ def calc_entry_score(symbol):
             score += 10
             details.append(f"🎯 Daily confluence — {conf_note}")
 
-    # ── Pattern context: break-retest-continuation, checked on BOTH 4H and 1H ──
-    # Previously only 4H was checked. If both timeframes independently show a
-    # retest in progress (or confirmed), that's a stronger confluence signal
-    # than either alone — worth surfacing distinctly rather than just picking
-    # one timeframe.
-    pattern_note_4h = detect_break_retest_pattern(klines_4h, current_price) if klines_4h else None
-    pattern_note_1h = detect_break_retest_pattern(klines_1h, current_price) if klines_1h else None
+    # ── Pattern context: break-retest-continuation, checked across 15m/30m/1H/4H ──
+    # Previously only 4H and 1H were checked. The SOPH and BROCCOLI714 cases
+    # showed real retest setups visible on 15m/30m that the 1H/4H-only check
+    # missed entirely (the move was too fast/small to show up as a "resistance
+    # break" on the larger timeframes yet). Checking all four and reporting
+    # each independently lets the person see exactly which timeframes agree.
+    pattern_notes = {}
+    for tf_label, klines_tf in [("15m", klines_15m), ("30m", klines_30m),
+                                  ("1h", klines_1h), ("4h", klines_4h)]:
+        if klines_tf:
+            note = detect_break_retest_pattern(klines_tf, current_price)
+            if note:
+                pattern_notes[tf_label] = note
 
     label = "🟢 HIGH" if score / max_score >= 0.75 else ("🟡 MEDIUM" if score / max_score >= 0.45 else "🔴 LOW")
     return {
         "score": score, "max_score": max_score, "label": label,
         "details": details, "price": current_price,
-        "pattern_note": pattern_note_4h,       # kept for backward compatibility
-        "pattern_note_4h": pattern_note_4h,
-        "pattern_note_1h": pattern_note_1h,
+        "pattern_note": pattern_notes.get("4h"),  # kept for backward compatibility
+        "pattern_note_4h": pattern_notes.get("4h"),
+        "pattern_note_1h": pattern_notes.get("1h"),
+        "pattern_notes": pattern_notes,  # {tf_label: note} for all timeframes that had one
     }
 
 
@@ -4125,19 +4134,19 @@ def handle_commands():
                             send_to(chat_id, f"⚠️ Couldn't fetch enough data for {sym}. Check the symbol and try again.")
                         else:
                             details_str = "\n".join(result["details"])
-                            note_4h = result.get("pattern_note_4h")
-                            note_1h = result.get("pattern_note_1h")
+                            pattern_notes = result.get("pattern_notes", {})
                             pattern_section = ""
-                            if note_4h or note_1h:
+                            if pattern_notes:
+                                tf_order = ["15m", "30m", "1h", "4h"]
+                                active_tfs = [tf for tf in tf_order if tf in pattern_notes]
+                                retest_tfs = [tf for tf in active_tfs
+                                              if "in progress" in pattern_notes[tf] or "confirmed" in pattern_notes[tf]]
                                 lines = []
-                                # Confluence callout when both timeframes show a retest situation
-                                if note_4h and note_1h and ("in progress" in note_4h or "confirmed" in note_4h) \
-                                        and ("in progress" in note_1h or "confirmed" in note_1h):
-                                    lines.append("🎯 <b>Confluence — both 4H and 1H show a retest setup:</b>\n")
-                                if note_4h:
-                                    lines.append(f"📐 <b>Pattern Context (4H):</b>\n{note_4h}")
-                                if note_1h:
-                                    lines.append(f"📐 <b>Pattern Context (1H):</b>\n{note_1h}")
+                                if len(retest_tfs) >= 2:
+                                    tf_label = " and ".join(t.upper() for t in retest_tfs)
+                                    lines.append(f"🎯 <b>Confluence — {tf_label} all show a retest setup:</b>\n")
+                                for tf in active_tfs:
+                                    lines.append(f"📐 <b>Pattern Context ({tf.upper()}):</b>\n{pattern_notes[tf]}")
                                 pattern_section = "\n" + "\n\n".join(lines) + "\n"
                             send_to(chat_id,
                                 f"📊 <b>Entry Check — {sym}</b>\n\n"
@@ -4159,24 +4168,26 @@ def handle_commands():
                         if watch_key in retest_watch_list:
                             send_to(chat_id, f"👁 Already watching {sym} for a retest completion.")
                         else:
-                            klines_4h_check = get_klines(sym, interval="4h", limit=30)
-                            klines_1h_check = get_klines(sym, interval="1h", limit=30)
                             ticker_check = get_ticker(sym)
-                            if not (klines_4h_check or klines_1h_check) or not ticker_check:
+                            klines_by_tf = {
+                                tf: get_klines(sym, interval=tf, limit=30)
+                                for tf in ["15m", "30m", "1h", "4h"]
+                            }
+                            if not any(klines_by_tf.values()) or not ticker_check:
                                 send_to(chat_id, f"⚠️ Couldn't fetch data for {sym}. Check the symbol and try again.")
                             else:
                                 current_price_check = float(ticker_check["lastPrice"])
-                                pattern_4h = detect_break_retest_pattern(klines_4h_check, current_price_check) if klines_4h_check else None
-                                pattern_1h = detect_break_retest_pattern(klines_1h_check, current_price_check) if klines_1h_check else None
                                 tfs_in_progress = []
-                                if pattern_4h and "Retest in progress" in pattern_4h:
-                                    tfs_in_progress.append("4h")
-                                if pattern_1h and "Retest in progress" in pattern_1h:
-                                    tfs_in_progress.append("1h")
+                                for tf, klines_tf in klines_by_tf.items():
+                                    if not klines_tf:
+                                        continue
+                                    pattern_note = detect_break_retest_pattern(klines_tf, current_price_check)
+                                    if pattern_note and "Retest in progress" in pattern_note:
+                                        tfs_in_progress.append(tf)
 
                                 if not tfs_in_progress:
                                     send_to(chat_id,
-                                        f"⚠️ {sym} doesn't currently show an in-progress retest on 4H or 1H. "
+                                        f"⚠️ {sym} doesn't currently show an in-progress retest on 15m/30m/1H/4H. "
                                         f"/watch works best right after /entry shows a \"Retest in progress\" Pattern Context."
                                     )
                                 else:
