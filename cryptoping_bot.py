@@ -3952,6 +3952,13 @@ def analyze_move_strength(symbol, confirm_price):
     fires, it overrides the strength suggestion entirely with an explicit warning,
     since a confirmed retest under a distribution pattern is the most dangerous
     combination — it looks like the "safe" signal but isn't.
+
+    Separately, it checks (same logic as the manual-zone liquidity sweep
+    detector) whether the retest's low actually swept below a previously
+    established swing low (tested 2+ times — real sell-side liquidity) and
+    reclaimed it. A retest backed by a genuine liquidity grab is a stronger
+    setup than a plain bounce, since it suggests stop-losses/limit orders below
+    the level were absorbed rather than the move just running out of sellers.
     """
     details = []
     strength_score = 0
@@ -4032,9 +4039,54 @@ def analyze_move_strength(symbol, confirm_price):
     if not hl_5m and not hl_15m:
         details.append("⚠️ No clear higher-low structure yet (5M/15M)")
 
-    # Combined suggestion
+    # ── Liquidity sweep check ──
+    # Uses the same logic as the manual-zone liquidity sweep detector: did the
+    # retest's low actually sweep below a previously-established swing low (one
+    # that's been tested 2+ times — real sell-side liquidity, not a random dip)
+    # and reclaim it? If so, this retest is backed by a genuine liquidity grab,
+    # not just a bounce — a meaningfully stronger signal than volume/HL alone.
+    liquidity_swept = False
+    klines_1h_sweep = get_klines(symbol, interval="1h", limit=15)
+    if klines_1h_sweep and len(klines_1h_sweep) >= 10:
+        last_sweep = klines_1h_sweep[-2]
+        ls_open, ls_high, ls_low, ls_close = (float(last_sweep[1]), float(last_sweep[2]),
+                                               float(last_sweep[3]), float(last_sweep[4]))
+        candle_range_sweep = ls_high - ls_low
+        if candle_range_sweep > 0:
+            lower_wick_sweep = min(ls_open, ls_close) - ls_low
+            wick_dominant_sweep = lower_wick_sweep / candle_range_sweep >= 0.55
+
+            lookback_sweep = klines_1h_sweep[-10:-2]
+            swing_low_sweep = min(float(k[3]) for k in lookback_sweep)
+            touches_sweep = sum(
+                1 for k in lookback_sweep
+                if abs(float(k[3]) - swing_low_sweep) / swing_low_sweep <= 0.015
+            )
+            established_sweep = touches_sweep >= 2
+            swept_below_sweep = ls_low < swing_low_sweep * 0.998
+            reclaimed_sweep = ls_close > swing_low_sweep
+
+            m_vol_sweep = float(last_sweep[5])
+            prev_vols_sweep = [float(k[5]) for k in klines_1h_sweep[-8:-2]]
+            avg_vol_sweep = sum(prev_vols_sweep) / len(prev_vols_sweep) if prev_vols_sweep else 1
+            vol_ratio_sweep = m_vol_sweep / avg_vol_sweep if avg_vol_sweep > 0 else 0
+
+            liquidity_swept = (
+                established_sweep and swept_below_sweep and reclaimed_sweep and
+                wick_dominant_sweep and vol_ratio_sweep >= 1.3
+            )
+            if liquidity_swept:
+                strength_score += 2
+                details.append(
+                    f"🩸 Liquidity sweep — swept below {format_price(swing_low_sweep)} "
+                    f"(tested {touches_sweep}x prior) and reclaimed on {vol_ratio_sweep:.1f}x volume"
+                )
+
     if strength_score >= 3:
-        suggestion = "🔥 <b>Strong move</b> — volume and structure both look healthy. An earlier entry can be considered, still with a stop-loss."
+        if liquidity_swept:
+            suggestion = "🔥 <b>Strong move</b> — backed by a genuine liquidity sweep plus healthy volume/structure. An earlier entry can be considered, still with a stop-loss below the sweep low."
+        else:
+            suggestion = "🔥 <b>Strong move</b> — volume and structure both look healthy. An earlier entry can be considered, still with a stop-loss."
     elif strength_score >= 1:
         suggestion = "⏳ <b>Moderate signs</b> — some support, but consider waiting for 4H to confirm before a full-size entry."
     else:
